@@ -191,14 +191,7 @@ const SUPPORTED_BLOCKS: &[&str] = &[
 ///
 /// Two shapes carry blocks: `messages[*].content[*]` and a `system` that is
 /// itself an array of blocks (system blocks have no `content` wrapper).
-fn validate_content_blocks(body: &[u8]) -> Result<(), String> {
-    let value: Value = match serde_json::from_slice(body) {
-        Ok(v) => v,
-        // Malformed JSON is reported by the typed parse below with serde's
-        // own error; duplicating that message here would be noise.
-        Err(_) => return Ok(()),
-    };
-
+fn validate_content_blocks(value: &Value) -> Result<(), String> {
     let reject = |kind: &str| -> String {
         format!(
             "unsupported content block type '{kind}': this proxy translates only \
@@ -219,18 +212,35 @@ fn validate_content_blocks(body: &[u8]) -> Result<(), String> {
         }
     }
 
-    if let Some(messages) = value.get("messages").and_then(|m| m.as_array()) {
-        for message in messages {
-            let Some(blocks) = message.get("content").and_then(|c| c.as_array()) else {
-                continue;
-            };
-            for block in blocks {
-                if let Some(kind) = block.get("type").and_then(|t| t.as_str()) {
-                    if !SUPPORTED_BLOCKS.contains(&kind) {
-                        return Err(reject(kind));
-                    }
+    // Nested blocks: a tool_result carries its own content array that the
+    // translator walks too — validate it as well, or an unsupported block
+    // there is silently dropped by tool_result_text (fleet finding).
+    fn check_blocks(blocks: &[Value], reject: &dyn Fn(&str) -> String) -> Result<(), String> {
+        for block in blocks {
+            if let Some(kind) = block.get("type").and_then(|t| t.as_str()) {
+                if !SUPPORTED_BLOCKS.contains(&kind) {
+                    return Err(reject(kind));
                 }
             }
+            if kind_is_tool_result(block) {
+                if let Some(nested) = block.get("content").and_then(|c| c.as_array()) {
+                    check_blocks(nested, reject)?;
+                }
+            }
+        }
+        Ok(())
+    }
+    fn kind_is_tool_result(block: &Value) -> bool {
+        block.get("type").and_then(|t| t.as_str()) == Some("tool_result")
+    }
+
+    if let Some(messages) = value.get("messages").and_then(|m| m.as_array()) {
+        for message in messages {
+            if let Some(blocks) = message.get("content").and_then(|c| c.as_array()) {
+                check_blocks(blocks, &reject)?;
+            }
+            // tool_result blocks can also appear flattened here when content
+            // is a single-block array; check_blocks covers the nesting.
         }
     }
     Ok(())
@@ -245,13 +255,26 @@ async fn messages(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
+    // Single parse of the body (fleet finding: it was deserialized twice per
+    // request). The Value feeds both block validation and, via from_value,
+    // the typed request — one byte-level parse instead of two.
+    let value: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                format!("malformed request body: {e}"),
+            )
+        }
+    };
     // Reject unsupported content blocks explicitly instead of letting the
     // translator drop them: a silently discarded block changes what the model
     // sees relative to what the client sent.
-    if let Err(message) = validate_content_blocks(&body) {
+    if let Err(message) = validate_content_blocks(&value) {
         return error_response(StatusCode::BAD_REQUEST, "invalid_request_error", message);
     }
-    let req: MessagesRequest = match serde_json::from_slice(&body) {
+    let req: MessagesRequest = match serde_json::from_value(value) {
         Ok(r) => r,
         Err(e) => {
             return error_response(
@@ -451,9 +474,25 @@ async fn collect_events(mut body: UpstreamBody, model: String) -> Vec<StreamEven
     let mut parser = SseParser::default();
     let mut translator = ResponsesToAnthropic::new(model);
     let mut events = Vec::new();
-    while let Some(chunk) = body.next().await {
+    // Same idle guard as the streaming path (fleet finding: a wedged upstream
+    // sending headers but no bytes would hang the non-streaming request
+    // forever — reqwest only has a connect timeout).
+    let mut last_activity = Instant::now();
+    loop {
+        let next = match tokio::time::timeout(PING_INTERVAL, body.next()).await {
+            Ok(next) => next,
+            Err(_elapsed) => {
+                if last_activity.elapsed() >= MAX_STREAM_IDLE {
+                    tracing::warn!("non-streaming upstream idle for {MAX_STREAM_IDLE:?}; aborting");
+                    break;
+                }
+                continue;
+            }
+        };
+        let Some(chunk) = next else { break };
         match chunk {
             Ok(chunk) => {
+                last_activity = Instant::now();
                 for frame in parser.push(&chunk) {
                     if let Ok(value) = serde_json::from_str::<Value>(&frame.data) {
                         events.extend(translator.handle(&value));

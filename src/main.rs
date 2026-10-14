@@ -60,6 +60,20 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
 
+    // Fleet finding: nothing warmed the catalog on boot, so the first
+    // inference after a restart blocked on the cold upstream /models fetch
+    // (up to 30s). Warm it out-of-band before accepting traffic.
+    {
+        let catalog = state.catalog.clone();
+        tokio::spawn(async move {
+            catalog.models().await;
+        });
+    }
+    if state.auth_token.is_none() {
+        tracing::warn!(
+            "auth disabled: CLAUDECODEX_AUTH_TOKEN is unset or empty; any local process can use this proxy"
+        );
+    }
     let addr = format!("{}:{}", cli.bind, cli.port);
     let listener = tokio::net::TcpListener::bind(&addr)
         .await

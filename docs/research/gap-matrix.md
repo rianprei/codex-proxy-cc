@@ -14,7 +14,7 @@ Cada linha: achado da frota → estado → fix → prova.
 | 6 | [baixo] abort desarmado após headers (~300s undici) | `jsonT` mantém o timer até o fim do parse | router.mjs |
 | 7 | [baixo] 3 round-trips + gerador não-idempotente | snapshot compartilhado + early-return-on-equal REAL | mtime congelado em launches consecutivos |
 | 8 | [baixo] MODEL_FAST morta no gerador | removida | grep 1→0 |
-| B | [alto] wiring output_config.effort sem teste e2e | `native_output_config_effort_flows_end_to_end` + 3 testes de precedência/mudança-de-modelo | 46 testes |
+| B | [alto] wiring output_config.effort sem teste e2e | `native_output_config_effort_flows_end_to_end` + 3 testes de precedência/mudança-de-modelo | 48 testes |
 | D | [médio] log de esforço cru (forja de journal) | só níveis declarados são printáveis; hostil → `<invalid>` | server.rs printable |
 | G | [médio] catálogo sem asserts herméticos | os 4 mains, sem `:`, legacy ausente-mas-resolvível — tudo por HTTP | `catalog_is_exactly_the_main_base_models_once_each` |
 | K | [médio] predicado de quota duplicado | `is_quota_exhaustion` único, usado nos 2 sítios | upstream.rs/server.rs |

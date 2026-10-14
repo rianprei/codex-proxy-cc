@@ -1,11 +1,11 @@
 # Plano de testes — claudecodex (commit 595c468)
 
-## Camada 1 — unitários (in-src): 19
+## Camada 1 — unitários (in-src): 18
 Parser SSE, shape Anthropic, round-trip auth, alias/effort (incl. `ultracode`
 → clamp), OutputConfig parse, catálogo um-por-base, sem duplicatas,
 legacy-resolvível, exaustão de esforço inventado sem metadado.
 
-## Camada 2 — integração hermética (tests/integration.rs): 27
+## Camada 2 — integração hermética (tests/integration.rs): 30
 Mock axum em porta efêmera; codex-home falso em tmp; zero credencial real.
 - Protocolo: ordem message_start…message_stop, índices monotônicos, texto em
   deltas, assembly de tool args em JSON válido, system/multi-turn, tool_result
@@ -21,7 +21,7 @@ Mock axum em porta efêmera; codex-home falso em tmp; zero credencial real.
 - Auth: 401 sem/com token errado (0 hits), 200 com correto
 - Concorrência: 8 sessões isoladas
 
-## Camada 3 — regressão de campo (tests/regression.sh): 25 checks
+## Camada 3 — regressão de campo (tests/regression.sh): 18 checks
 Dispatcher sem loop de exec, catálogo 4-base/0-variantes, auth 401/401/200,
 Host 403, path 404, token em log 0, picker 4 linhas sem `:`, defaults,
 settings byte-a-baseline, launcher discovery+`--model` injetado.
@@ -34,8 +34,8 @@ has been reached" desde 2026-10-13); fail-closed preservado.
 
 ## Comandos
 ```bash
-cargo test                                   # 46 verdes
+cargo test                                   # 48 verdes (18 unit + 30 integration)
 cargo fmt --check && cargo clippy --all-targets -- -D warnings   # limpo/0
-bash tests/regression.sh                     # 25 verdes
+bash tests/regression.sh                     # 18 verdes
 claude; claude --help; claude -p "Responda exatamente OK"
 ```

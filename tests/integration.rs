@@ -616,6 +616,72 @@ async fn unsupported_block_in_system_is_rejected() {
     assert!(raw.contains("'server_tool_use'"), "body was {raw}");
 }
 
+/// Fleet finding: no test asserted that an image block actually reaches the
+/// upstream as input_image — a silent image_item() regression would drop
+/// images with the whole suite green.
+#[tokio::test]
+async fn image_block_reaches_upstream_as_input_image() {
+    let (addr, mock, _h) = MockUpstream::new(&good_sse()).spawn().await;
+    let state = mock.state(addr, "image-fwd", None).await;
+
+    let req = serde_json::json!({
+        "model": "claude-gpt-6-astra",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGk="}},
+                {"type": "text", "text": "what is this"}
+            ]
+        }]
+    });
+    let (status, raw) = post_messages(&state, None, req).await;
+    assert_eq!(status, StatusCode::OK, "body was {raw}");
+    let sent = mock.last_body();
+    assert!(
+        sent.contains("input_image"),
+        "image must reach the upstream as input_image, got: {sent}"
+    );
+}
+
+/// Regression (fleet re-review): a "document" nested INSIDE tool_result.content
+/// used to escape validation — tool_result_text dropped it silently and the
+/// upstream received an empty output with a 200.
+#[tokio::test]
+async fn document_nested_in_tool_result_is_rejected() {
+    let (addr, mock, _h) = MockUpstream::new(&good_sse()).spawn().await;
+    let state = mock.state(addr, "nested-doc", None).await;
+
+    let req = serde_json::json!({
+        "model": "claude-gpt-6-astra",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": [
+            {"role":"assistant","content":[
+                {"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"/x"}}
+            ]},
+            {"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"t1","content":[
+                    {"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"JVBERi0="}},
+                    {"type":"text","text":"ok"}
+                ]}
+            ]}
+        ]
+    });
+    let (status, raw) = post_messages(&state, None, req).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "nested document must be rejected; body was {raw}"
+    );
+    assert!(
+        raw.contains("'document'"),
+        "error must name the type: {raw}"
+    );
+    assert_eq!(mock.responses_calls(), 0, "must never reach the upstream");
+}
+
 /// A supported block set still passes validation untouched.
 #[tokio::test]
 async fn supported_blocks_pass_validation() {
@@ -782,13 +848,42 @@ fn retry_after_is_capped() {
 }
 
 // ---------------------------------------------------------------------------
+// Upstream credential forwarding (fleet finding: zero coverage)
+// ---------------------------------------------------------------------------
+
+/// The proxy must forward the Codex session credentials on EVERY upstream
+/// call: Bearer <access_token> plus the chatgpt-account-id header. A
+/// regression here leaves every test green and production 401.
+#[tokio::test]
+async fn upstream_receives_codex_credentials() {
+    let (addr, mock, _h) = MockUpstream::new(&good_sse()).spawn().await;
+    let state = mock.state(addr, "cred-forward", None).await;
+
+    let (status, _) = post_messages(&state, None, simple_request()).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let auths = mock.recorded.auth_headers.lock().unwrap().clone();
+    assert!(
+        !auths.is_empty(),
+        "upstream must receive an Authorization header"
+    );
+    assert!(
+        auths
+            .iter()
+            .any(|h| h.starts_with("Bearer test-access-token")),
+        "upstream Authorization must carry the codex access token, got: {:?}",
+        auths
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Concurrency
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn concurrent_sessions_are_isolated() {
-    let (addr, _mock, _h) = MockUpstream::new(&good_sse()).spawn().await;
-    let state = _mock.state(addr, "concurrent", None).await;
+    let (addr, mock, _h) = MockUpstream::new(&good_sse()).spawn().await;
+    let state = mock.state(addr, "concurrent", None).await;
 
     let mut set = tokio::task::JoinSet::new();
     for i in 0..8 {
@@ -807,4 +902,13 @@ async fn concurrent_sessions_are_isolated() {
         }
     }
     assert_eq!(ok, 8, "all concurrent sessions must succeed");
+    // Fleet finding: the test promised "isolation" but only counted 200s.
+    // Assert each distinct body actually reached the upstream intact.
+    let bodies = mock.recorded.bodies.lock().unwrap().join("\n");
+    for i in 0..8 {
+        assert!(
+            bodies.contains(&format!("msg-{i}")),
+            "body msg-{i} lost or cross-contaminated between concurrent sessions"
+        );
+    }
 }

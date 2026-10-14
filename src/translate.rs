@@ -324,7 +324,15 @@ pub fn build_tools(req: &MessagesRequest) -> Vec<Value> {
         .filter_map(|t| {
             if let Some(kind) = t.kind.as_deref() {
                 if kind != "custom" {
-                    tracing::warn!(tool = %t.name, kind, "skipping unsupported server tool");
+                    // Redacted: the name is client-controlled JSON — only printable
+                    // ASCII, capped, or the journal can be forged (fleet finding).
+                    let safe_name: String = t
+                        .name
+                        .chars()
+                        .filter(|c| c.is_ascii_graphic())
+                        .take(64)
+                        .collect();
+                    tracing::warn!(tool = %safe_name, "skipping unsupported server tool");
                     return None;
                 }
             }

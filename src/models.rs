@@ -101,12 +101,14 @@ pub fn is_known_effort(e: &str) -> bool {
 
 pub fn public_list(models: &[UpstreamModel], created_at: &str) -> Vec<PublicModel> {
     let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for m in models {
         // One entry per base model. Effort is a request parameter (native
         // Claude Code effort control / id suffix), never a separate model id.
         if !is_main(&m.slug) {
             continue;
         }
+        seen.insert(m.slug.clone());
         let display = if m.display_name.is_empty() {
             m.slug.clone()
         } else {
@@ -119,6 +121,13 @@ pub fn public_list(models: &[UpstreamModel], created_at: &str) -> Vec<PublicMode
             kind: "model",
             created_at: created_at.to_string(),
         });
+    }
+    // Fleet finding: a main slug missing from the upstream catalog used to
+    // vanish from the picker in silence. Loud now.
+    for slug in MAIN_SLUGS {
+        if !seen.contains(*slug) {
+            tracing::warn!(slug, "main model missing from upstream catalog");
+        }
     }
     out
 }
