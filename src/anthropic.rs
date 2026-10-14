@@ -22,6 +22,18 @@ pub struct MessagesRequest {
     pub stream: bool,
     #[serde(default)]
     pub thinking: Option<Thinking>,
+    /// Native Claude Code effort control: the client carries the user's current
+    /// effort selection in `output_config.effort` (gateway protocol contract).
+    #[serde(default)]
+    pub output_config: Option<OutputConfig>,
+}
+
+/// Only the effort field is consumed; other output_config settings pass through
+/// the unknown-field path and are ignored.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OutputConfig {
+    #[serde(default)]
+    pub effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

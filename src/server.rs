@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -49,6 +49,27 @@ pub fn router(state: AppState) -> Router {
 
 fn error_response(status: StatusCode, kind: &str, message: impl Into<String>) -> Response {
     (status, Json(ErrorBody::new(kind, message))).into_response()
+}
+
+/// Error response carrying a `retry-after` the client can act on.
+///
+/// Per the Claude Code gateway contract, `retry-after` is integer seconds and a
+/// value above 60 stops the client's automatic retries and surfaces the error
+/// immediately. Quota exhaustion ("usage limit") will not recover inside any
+/// window the client would retry in, so it gets a terminal value; a transient
+/// 429 that survived the proxy's own bounded retries forwards the upstream's
+/// own header when present, or a short pause otherwise.
+fn error_response_with_retry(
+    status: StatusCode,
+    kind: &str,
+    message: impl Into<String>,
+    retry_after_secs: u64,
+) -> Response {
+    let mut res = error_response(status, kind, message);
+    if let Ok(v) = HeaderValue::from_str(&retry_after_secs.to_string()) {
+        res.headers_mut().insert("retry-after", v);
+    }
+    res
 }
 
 async fn log_request(req: Request, next: Next) -> Response {
@@ -108,9 +129,11 @@ async fn list_models(State(state): State<AppState>) -> Response {
     .into_response()
 }
 
-async fn count_tokens(Json(body): Json<Value>) -> Response {
+async fn count_tokens(body: axum::body::Bytes) -> Response {
     // Rough estimate: the upstream exposes no token counter for the Codex backend.
-    let chars = body.to_string().len() as u64;
+    // Counts raw request bytes — re-serializing the parsed JSON would cost an
+    // extra O(body) allocation on an endpoint Claude Code calls frequently.
+    let chars = body.len() as u64;
     Json(json!({ "input_tokens": chars.div_ceil(4) })).into_response()
 }
 
@@ -132,6 +155,14 @@ fn upstream_error_response(err: UpstreamError) -> Response {
                 s if s.is_server_error() => "api_error",
                 _ => "api_error",
             };
+            // Quota exhaustion is terminal for any window the client retries
+            // in: tell it to stop (>60s per the gateway contract) so the user
+            // sees the error at once instead of a silent retry loop.
+            if status == StatusCode::TOO_MANY_REQUESTS
+                && crate::upstream::is_quota_exhaustion(&body)
+            {
+                return error_response_with_retry(status, kind, message, 3600);
+            }
             error_response(status, kind, message)
         }
         UpstreamError::Other(e) => error_response(
@@ -140,6 +171,69 @@ fn upstream_error_response(err: UpstreamError) -> Response {
             format!("upstream: {e:#}"),
         ),
     }
+}
+
+/// Content block types this proxy can faithfully translate to the Codex
+/// Responses API. Anything else must fail loudly, not silently vanish.
+const SUPPORTED_BLOCKS: &[&str] = &[
+    "text",
+    "image",
+    "tool_use",
+    "tool_result",
+    "thinking",
+    "redacted_thinking",
+];
+
+/// Walks every content array in the raw request and rejects block types the
+/// translator does not support, naming the offending type so the client can
+/// act on it. Runs before typed deserialization because `#[serde(other)]`
+/// maps unknown blocks to `Unknown` and discards the tag.
+///
+/// Two shapes carry blocks: `messages[*].content[*]` and a `system` that is
+/// itself an array of blocks (system blocks have no `content` wrapper).
+fn validate_content_blocks(body: &[u8]) -> Result<(), String> {
+    let value: Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        // Malformed JSON is reported by the typed parse below with serde's
+        // own error; duplicating that message here would be noise.
+        Err(_) => return Ok(()),
+    };
+
+    let reject = |kind: &str| -> String {
+        format!(
+            "unsupported content block type '{kind}': this proxy translates only \
+             [{}]. The Codex backend for ChatGPT accounts accepts text and image \
+             inputs, so '{kind}' cannot be forwarded; remove or convert it before \
+             retrying.",
+            SUPPORTED_BLOCKS.join(", ")
+        )
+    };
+
+    if let Some(blocks) = value.get("system").and_then(|s| s.as_array()) {
+        for block in blocks {
+            if let Some(kind) = block.get("type").and_then(|t| t.as_str()) {
+                if !SUPPORTED_BLOCKS.contains(&kind) {
+                    return Err(reject(kind));
+                }
+            }
+        }
+    }
+
+    if let Some(messages) = value.get("messages").and_then(|m| m.as_array()) {
+        for message in messages {
+            let Some(blocks) = message.get("content").and_then(|c| c.as_array()) else {
+                continue;
+            };
+            for block in blocks {
+                if let Some(kind) = block.get("type").and_then(|t| t.as_str()) {
+                    if !SUPPORTED_BLOCKS.contains(&kind) {
+                        return Err(reject(kind));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -151,6 +245,12 @@ async fn messages(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
+    // Reject unsupported content blocks explicitly instead of letting the
+    // translator drop them: a silently discarded block changes what the model
+    // sees relative to what the client sent.
+    if let Err(message) = validate_content_blocks(&body) {
+        return error_response(StatusCode::BAD_REQUEST, "invalid_request_error", message);
+    }
     let req: MessagesRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => {
@@ -170,7 +270,13 @@ async fn messages(
         );
     };
     let upstream_model = state.catalog.model(&resolved.slug).await;
+    let request_effort = req
+        .output_config
+        .as_ref()
+        .and_then(|o| o.effort.as_deref())
+        .filter(|e| !e.is_empty());
     let effort = translate::choose_effort(
+        request_effort,
         resolved.effort.as_deref(),
         req.thinking.as_ref(),
         &state.default_effort,
@@ -178,6 +284,38 @@ async fn messages(
     );
     let session_id = header_str(&headers, "x-claude-code-session-id");
     let upstream_req = translate::anthropic_to_responses(&req, &resolved.slug, &effort, session_id);
+    // Diagnostic chain (redacted: ids and effort levels only, never prompts,
+    // tokens or credentials): selected id -> backend slug -> effort the client
+    // sent (with its source) -> effort forwarded upstream. The raw client
+    // string is sanitized: only declared effort levels are printable, so a
+    // hostile output_config can never forge or flood the log.
+    let effort_source = if request_effort.is_some() {
+        "request"
+    } else if resolved.effort.is_some() {
+        "id_suffix"
+    } else if req
+        .thinking
+        .as_ref()
+        .map(|t| t.kind == "enabled" && t.budget_tokens.is_some())
+        .unwrap_or(false)
+    {
+        "thinking"
+    } else {
+        "default"
+    };
+    let effort_received = request_effort.or(resolved.effort.as_deref()).unwrap_or("-");
+    let printable = if effort_received == "-" || translate::is_known_effort(effort_received) {
+        effort_received
+    } else {
+        "<invalid>"
+    };
+    tracing::info!(
+        selected_model = %req.model,
+        backend_slug = %resolved.slug,
+        effort_received = %format!("{effort_source}:{printable}"),
+        effort_sent = %effort,
+        "model resolution"
+    );
     tracing::debug!(
         model = %resolved.slug,
         %effort,

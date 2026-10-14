@@ -24,16 +24,28 @@ pub const SIGNATURE_PREFIX: &str = "codexenc:";
 // Request direction
 // ---------------------------------------------------------------------------------------------
 
-/// Choose the reasoning effort: explicit `:<effort>` suffix, else Anthropic thinking budget,
-/// else the CLI default, clamped to what the model advertises.
+/// Choose the reasoning effort, highest priority first:
+///
+/// 1. `output_config.effort` — the native Claude Code effort control (/effort,
+///    effortLevel settings). When present it is the user's current explicit
+///    choice and wins over everything: changing effort must never require
+///    switching model ids.
+/// 2. `:<effort>` suffix on the model id — the direct-API channel, for
+///    callers that do not send output_config.
+/// 3. Anthropic thinking budget, mapped to a coarse level.
+/// 4. The CLI default (operator's explicit choice), clamped to what the
+///    backend advertises for the model; an unsupported value falls back to
+///    the backend-declared default, never to an invented level.
 pub fn choose_effort(
+    request_effort: Option<&str>,
     suffix: Option<&str>,
     thinking: Option<&Thinking>,
     cli_default: &str,
     model: Option<&UpstreamModel>,
 ) -> String {
-    let wanted = suffix
+    let wanted = request_effort
         .map(str::to_string)
+        .or_else(|| suffix.map(str::to_string))
         .or_else(|| {
             thinking
                 .filter(|t| t.kind == "enabled")
@@ -48,11 +60,25 @@ pub fn choose_effort(
                     }
                     .to_string()
                 })
-        })
-        .unwrap_or_else(|| cli_default.to_string());
-    let Some(model) = model else { return wanted };
-    if suffix.is_some() || model.supported_reasoning_levels.is_empty() {
-        return wanted;
+        });
+    let Some(model) = model else {
+        // Sem metadado do modelo nao ha como validar: recusa esforco arbitrario
+        // (string controlada pelo cliente) e cai no default do operador.
+        return wanted
+            .filter(|e| KNOWN_EFFORTS.contains(&e.as_str()))
+            .unwrap_or_else(|| cli_default.to_string());
+    };
+    // The CLI default is the operator's explicit choice and wins over the
+    // backend-declared default; the backend default only applies as the
+    // clamp below when the chosen level is not supported by the model.
+    let wanted = wanted.unwrap_or_else(|| cli_default.to_string());
+    if model.supported_reasoning_levels.is_empty() {
+        // Catalogue gap: without declared levels, accept only observed levels.
+        return if model_ok_uncatalogued(&wanted) {
+            wanted
+        } else {
+            cli_default.to_string()
+        };
     }
     if model
         .supported_reasoning_levels
@@ -71,6 +97,21 @@ pub fn choose_effort(
                 .map(|l| l.effort.clone())
         })
         .unwrap_or(wanted)
+}
+
+/// Effort levels the backend has been observed to declare across its models
+/// (dump autenticado 2026-10-13: low/medium/high/xhigh/max/ultra). Guard de
+/// emergencia para os caminhos sem metadado do modelo — nunca inventa nivel.
+const KNOWN_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
+
+fn model_ok_uncatalogued(e: &str) -> bool {
+    KNOWN_EFFORTS.contains(&e)
+}
+
+/// Public: is this an effort level the backend has been observed to declare?
+/// Used by the redacted diagnostic log (only printable levels reach journald).
+pub fn is_known_effort(e: &str) -> bool {
+    KNOWN_EFFORTS.contains(&e)
 }
 
 pub fn system_text(system: Option<&SystemPrompt>) -> String {
@@ -244,6 +285,11 @@ pub fn build_input(req: &MessagesRequest) -> Vec<Value> {
                         } => {
                             let Some((id, enc)) = signature.as_deref().and_then(parse_signature)
                             else {
+                                // Cross-model history: an Anthropic-signed
+                                // thinking block cannot replay to Codex — but
+                                // dropping it silently contradicts the
+                                // fail-loudly contract, so log it (no content).
+                                tracing::warn!("dropping thinking block with non-codex signature");
                                 continue;
                             };
                             b.flush();
@@ -945,27 +991,84 @@ mod tests {
             kind: "enabled".into(),
             budget_tokens: Some(b),
         };
-        assert_eq!(choose_effort(Some("xhigh"), None, "medium", None), "xhigh");
+        // New signature: (request_effort, suffix, thinking, cli_default, model)
+        // Suffix channel (direct API, no output_config).
         assert_eq!(
-            choose_effort(None, Some(&thinking(1024)), "medium", None),
+            choose_effort(None, Some("xhigh"), None, "medium", None),
+            "xhigh"
+        );
+        // Native control wins over the id suffix.
+        assert_eq!(
+            choose_effort(Some("low"), Some("xhigh"), None, "medium", None),
+            "low"
+        );
+        // Thinking-budget mapping.
+        assert_eq!(
+            choose_effort(None, None, Some(&thinking(1024)), "medium", None),
             "low"
         );
         assert_eq!(
-            choose_effort(None, Some(&thinking(8000)), "low", None),
+            choose_effort(None, None, Some(&thinking(8000)), "low", None),
             "medium"
         );
         assert_eq!(
-            choose_effort(None, Some(&thinking(32000)), "low", None),
+            choose_effort(None, None, Some(&thinking(32000)), "low", None),
             "high"
         );
-        assert_eq!(choose_effort(None, None, "medium", None), "medium");
+        assert_eq!(choose_effort(None, None, None, "medium", None), "medium");
         let model: UpstreamModel = serde_json::from_value(json!({
             "slug":"m","default_reasoning_level":"low",
             "supported_reasoning_levels":[{"effort":"low"},{"effort":"high"}]
         }))
         .expect("model");
-        assert_eq!(choose_effort(None, None, "medium", Some(&model)), "low");
-        assert_eq!(choose_effort(None, None, "high", Some(&model)), "high");
+        // Backend default applies when the client sends nothing.
+        assert_eq!(
+            choose_effort(None, None, None, "medium", Some(&model)),
+            "low"
+        );
+        assert_eq!(
+            choose_effort(None, None, None, "high", Some(&model)),
+            "high"
+        );
+        // Unsupported request effort clamps to the backend default, never an
+        // invented level.
+        assert_eq!(
+            choose_effort(Some("ultracode"), None, None, "medium", Some(&model)),
+            "low"
+        );
+        // Supported request effort passes through.
+        assert_eq!(
+            choose_effort(Some("high"), None, None, "medium", Some(&model)),
+            "high"
+        );
+        // Without model metadata, an invented value falls back to the CLI
+        // default (never reaches the backend).
+        assert_eq!(
+            choose_effort(Some("ultracode"), None, None, "medium", None),
+            "medium"
+        );
+    }
+
+    #[test]
+    fn output_config_effort_is_parsed() {
+        // The native Claude Code effort control arrives as output_config.effort.
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-gpt-6-astra",
+            "messages": [{"role":"user","content":"hi"}],
+            "output_config": {"effort": "high"}
+        }))
+        .expect("parses");
+        assert_eq!(
+            req.output_config.as_ref().and_then(|o| o.effort.as_deref()),
+            Some("high")
+        );
+        // Absent output_config stays None.
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-gpt-6-astra",
+            "messages": [{"role":"user","content":"hi"}]
+        }))
+        .expect("parses");
+        assert!(req.output_config.is_none());
     }
 
     fn drive(events: &[Value]) -> Vec<StreamEvent> {

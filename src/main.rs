@@ -1,12 +1,6 @@
-mod anthropic;
-mod auth;
-mod models;
-mod server;
-mod translate;
-mod upstream;
+use claudecodex::{server, upstream};
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use anyhow::Context;
 use clap::Parser;
@@ -58,15 +52,13 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let codex_home = cli.codex_home.unwrap_or_else(|| home_dir().join(".codex"));
-    let auth = Arc::new(auth::AuthStore::load(&codex_home).await?);
-    let upstream = Arc::new(upstream::Upstream::new(cli.upstream_base, auth)?);
-    let catalog = Arc::new(models::Catalog::new(upstream.clone()));
-    let state = server::AppState {
-        auth_token: cli.auth_token.filter(|t| !t.is_empty()),
-        upstream,
-        catalog,
-        default_effort: cli.default_reasoning_effort,
-    };
+    let state = claudecodex::build_state(
+        &cli.upstream_base,
+        &codex_home,
+        cli.auth_token.clone(),
+        &cli.default_reasoning_effort,
+    )
+    .await?;
 
     let addr = format!("{}:{}", cli.bind, cli.port);
     let listener = tokio::net::TcpListener::bind(&addr)

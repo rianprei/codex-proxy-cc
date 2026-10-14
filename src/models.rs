@@ -11,7 +11,12 @@ use crate::upstream::{Upstream, UpstreamModel};
 
 const PREFIX: &str = "claude-";
 const CACHE_TTL: Duration = Duration::from_secs(600);
-const UPSTREAM_TIMEOUT: Duration = Duration::from_millis(2500);
+/// The upstream /models endpoint is slow and highly variable under load
+/// (measured 1s–9s on a quota-throttled account). This fetch runs only when
+/// the catalog cache is cold or stale — never on the request hot path — so it
+/// can afford to wait. A short timeout here silently empties the catalog
+/// after every restart, which propagates to the client model picker.
+const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PublicModel {
@@ -70,9 +75,38 @@ pub fn resolve_in(models: &[UpstreamModel], id: &str) -> Option<Resolved> {
     Some(parsed)
 }
 
+/// Main models exposed in the selector — one entry per base model, curated by
+/// what the backend itself describes as its primary lineup (and each verified
+/// by real inference on this account). Auxiliary (codex-auto-review), reserve
+/// (gpt-reserve) and legacy (gpt-5.5, "Legacy coding model") slugs remain
+/// resolvable by direct id but are not advertised.
+const MAIN_SLUGS: &[&str] = &[
+    "gpt-6-astra",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+];
+
+fn is_main(slug: &str) -> bool {
+    MAIN_SLUGS.contains(&slug)
+}
+
+/// Effort levels the backend has been observed to declare (autenticated dump
+/// 2026-10-13). Exposed for the redacted diagnostic log: only these are
+/// printable, so a hostile `output_config.effort` can never forge journal
+/// entries.
+pub fn is_known_effort(e: &str) -> bool {
+    crate::translate::is_known_effort(e)
+}
+
 pub fn public_list(models: &[UpstreamModel], created_at: &str) -> Vec<PublicModel> {
     let mut out = Vec::new();
     for m in models {
+        // One entry per base model. Effort is a request parameter (native
+        // Claude Code effort control / id suffix), never a separate model id.
+        if !is_main(&m.slug) {
+            continue;
+        }
         let display = if m.display_name.is_empty() {
             m.slug.clone()
         } else {
@@ -80,27 +114,11 @@ pub fn public_list(models: &[UpstreamModel], created_at: &str) -> Vec<PublicMode
         };
         out.push(PublicModel {
             id: public_id(&m.slug, None),
-            display_name: display.clone(),
+            display_name: display,
             description: m.description.clone(),
             kind: "model",
             created_at: created_at.to_string(),
         });
-        for level in &m.supported_reasoning_levels {
-            if level.effort.is_empty() {
-                continue;
-            }
-            out.push(PublicModel {
-                id: public_id(&m.slug, Some(&level.effort)),
-                display_name: format!("{display} ({})", level.effort),
-                description: if level.description.is_empty() {
-                    m.description.clone()
-                } else {
-                    format!("{} — {}", m.description, level.description)
-                },
-                kind: "model",
-                created_at: created_at.to_string(),
-            });
-        }
     }
     out
 }
@@ -112,10 +130,12 @@ struct Cached {
 
 pub struct Catalog {
     upstream: Arc<Upstream>,
-    cache: RwLock<Option<Cached>>,
+    // Arc-wrapped so the background stale-while-revalidate task can hold a
+    // reference across the tokio::spawn boundary.
+    cache: Arc<RwLock<Option<Cached>>>,
     /// Serialises upstream refreshes so a cold or expired cache does not fan
     /// out into one `/models` call per concurrent request.
-    refresh: Mutex<()>,
+    refresh: Arc<Mutex<()>>,
     started_at: String,
 }
 
@@ -123,16 +143,25 @@ impl Catalog {
     pub fn new(upstream: Arc<Upstream>) -> Self {
         Self {
             upstream,
-            cache: RwLock::new(None),
-            refresh: Mutex::new(()),
+            cache: Arc::new(RwLock::new(None)),
+            refresh: Arc::new(Mutex::new(())),
             started_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         }
     }
 
-    /// Current model list: fresh cache, else upstream, else stale cache, else empty.
+    /// Current model list. Stale-while-revalidate: a fresh cache serves
+    /// directly; an expired cache with content serves immediately and refreshes
+    /// in the background; only a cold cache blocks on the upstream fetch, so
+    /// no inference request ever pays the catalog round-trip twice in a row.
     pub async fn models(&self) -> Vec<UpstreamModel> {
         if let Some(models) = self.fresh().await {
             return models;
+        }
+        // Stale content on hand: serve it, refresh out-of-band.
+        let stale = self.stale().await;
+        if !stale.is_empty() {
+            self.revalidate_background();
+            return stale;
         }
         let _guard = self.refresh.lock().await;
         // Another request may have refreshed while we waited for the guard.
@@ -156,6 +185,37 @@ impl Catalog {
                 self.stale().await
             }
         }
+    }
+
+    /// Out-of-band catalog refresh, single-flight across callers.
+    fn revalidate_background(&self) {
+        let upstream = Arc::clone(&self.upstream);
+        let cache = Arc::clone(&self.cache);
+        let refresh = Arc::clone(&self.refresh);
+        tokio::spawn(async move {
+            // Hold the refresh mutex inside the task so concurrent callers
+            // don't fan out into parallel /models fetches.
+            let _guard = refresh.lock().await;
+            // Someone else may have refreshed while this task queued on the mutex.
+            let already_fresh = cache
+                .read()
+                .await
+                .as_ref()
+                .map(|c| c.fetched.elapsed() < CACHE_TTL)
+                .unwrap_or(false);
+            if already_fresh {
+                return;
+            }
+            match upstream.list_models(UPSTREAM_TIMEOUT).await {
+                Ok(models) if !models.is_empty() => {
+                    *cache.write().await = Some(Cached {
+                        models,
+                        fetched: Instant::now(),
+                    });
+                }
+                _ => {}
+            }
+        });
     }
 
     async fn fresh(&self) -> Option<Vec<UpstreamModel>> {
@@ -196,22 +256,40 @@ mod tests {
     use crate::upstream::ReasoningLevel;
 
     fn fixture() -> Vec<UpstreamModel> {
-        vec![UpstreamModel {
-            slug: "gpt-5.5".into(),
-            display_name: "GPT-5.5".into(),
-            description: "General model".into(),
-            default_reasoning_level: Some("medium".into()),
-            supported_reasoning_levels: vec![
-                ReasoningLevel {
-                    effort: "low".into(),
-                    description: "fast".into(),
-                },
-                ReasoningLevel {
-                    effort: "high".into(),
-                    description: "".into(),
-                },
-            ],
-        }]
+        vec![
+            UpstreamModel {
+                slug: "gpt-5.5".into(),
+                display_name: "GPT-5.5".into(),
+                description: "General model".into(),
+                default_reasoning_level: Some("medium".into()),
+                supported_reasoning_levels: vec![
+                    ReasoningLevel {
+                        effort: "low".into(),
+                        description: "fast".into(),
+                    },
+                    ReasoningLevel {
+                        effort: "high".into(),
+                        description: "".into(),
+                    },
+                ],
+            },
+            UpstreamModel {
+                slug: "gpt-6-astra".into(),
+                display_name: "GPT-6-Astra".into(),
+                description: "Frontier intelligence".into(),
+                default_reasoning_level: Some("medium".into()),
+                supported_reasoning_levels: vec![
+                    ReasoningLevel {
+                        effort: "low".into(),
+                        description: "".into(),
+                    },
+                    ReasoningLevel {
+                        effort: "high".into(),
+                        description: "".into(),
+                    },
+                ],
+            },
+        ]
     }
 
     #[test]
@@ -235,21 +313,35 @@ mod tests {
 
     #[test]
     fn alias_round_trip() {
+        // The catalog advertises ONE entry per MAIN base model — no effort
+        // variants, no legacy/auxiliary slugs. Effort is a request parameter.
         let list = public_list(&fixture(), "2026-01-01T00:00:00Z");
         let ids: Vec<&str> = list.iter().map(|m| m.id.as_str()).collect();
-        assert_eq!(
-            ids,
-            vec![
-                "claude-gpt-5.5",
-                "claude-gpt-5.5:low",
-                "claude-gpt-5.5:high"
-            ]
-        );
-        assert_eq!(list[1].display_name, "GPT-5.5 (low)");
-        assert_eq!(list[2].description, "General model");
-        for m in &list {
-            assert!(resolve_in(&fixture(), &m.id).is_some(), "{}", m.id);
-        }
+        assert_eq!(ids, vec!["claude-gpt-6-astra"]);
+        assert_eq!(list[0].display_name, "GPT-6-Astra");
+        assert_eq!(list[0].description, "Frontier intelligence");
+        assert!(resolve_in(&fixture(), "claude-gpt-6-astra").is_some());
+    }
+
+    #[test]
+    fn catalog_has_no_effort_duplicates() {
+        // One entry per base model: no `:<effort>` ids in the public list.
+        let list = public_list(&fixture(), "2026-01-01T00:00:00Z");
+        assert!(list.iter().all(|m| !m.id.contains(':')));
+        let mut ids: Vec<&str> = list.iter().map(|m| m.id.as_str()).collect();
+        ids.sort();
+        let mut deduped = ids.clone();
+        deduped.dedup();
+        assert_eq!(ids, deduped, "no duplicated base model in catalog");
+    }
+
+    #[test]
+    fn non_main_models_still_resolve() {
+        // Legacy/reserve/auxiliary slugs are not advertised but remain
+        // resolvable by direct id, with the effort suffix for power use.
+        assert!(resolve_in(&fixture(), "claude-gpt-5.5").is_some());
+        assert!(resolve_in(&fixture(), "claude-gpt-5.5:high").is_some());
+        assert!(resolve_in(&fixture(), "claude-gpt-6-astra:high").is_some());
     }
 
     #[test]
