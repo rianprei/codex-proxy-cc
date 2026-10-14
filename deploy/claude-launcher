@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# claude — Claude Code no backend Codex da sua assinatura ChatGPT Pro.
+# Reusa a sessão de ~/.codex/auth.json. Sem API paga, sem fallback.
+# O wrapper original fica em ~/.local/bin/claude-pinned.
+
+set -euo pipefail
+
+CLAUDE_REAL_BIN="$HOME/.local/share/claude/versions/2.1.296"
+PORT="${CLAUDE_CODEX_PORT:-4180}"
+BASE="http://127.0.0.1:${PORT}"
+CCP_BIN="${CLAUDE_CODEX_BIN:-$HOME/.local/bin/claudecodex}"
+TOKEN_FILE="$HOME/.config/claude-codex/proxy.token"
+CFG_DIR="$HOME/.claude-codex"
+ROUTER_SERVICE="claude-multirouter.service"
+SNAPSHOT="$CFG_DIR/cache/catalog-snapshot.json"
+
+# IDs verificados por inferência real contra o backend desta conta.
+# Um modelo-base por entrada; esforço NÃO é modelo: vem do controle nativo do
+# Claude Code (output_config.effort -> /effort), que o proxy traduz. Sufixo
+# :effort continua disponível por API direta (ex.: claude-gpt-6-astra:xhigh).
+# Resolváveis mas fora do seletor (o backend os descreve como legacy/reserve):
+# claude-gpt-5.5, claude-gpt-reserve, claude-codex-auto-review.
+MODEL_MAIN="${CLAUDE_CODEX_MODEL:-claude-gpt-6-astra}"
+MODEL_FAST="${CLAUDE_CODEX_FAST_MODEL:-claude-gpt-5.6-luna}"
+
+die() { printf 'claude: %s\n' "$*" >&2; exit 1; }
+
+[ -x "$CCP_BIN" ] || die "claudecodex nao encontrado em $CCP_BIN"
+[ -x "$CLAUDE_REAL_BIN" ] || die "Claude Code nao encontrado em $CLAUDE_REAL_BIN"
+[ -s "$TOKEN_FILE" ] || die "token local ausente: $TOKEN_FILE"
+[ -f "$CFG_DIR/settings.json" ] || die "config isolado ausente: $CFG_DIR/settings.json"
+
+CODEX_AUTH="${CODEX_HOME:-$HOME/.codex}/auth.json"
+[ -f "$CODEX_AUTH" ] || die "sem sessao Codex em $CODEX_AUTH (rode: codex login)"
+
+TOKEN="$(cat "$TOKEN_FILE")"
+# Token fora do argv (fleet finding: /proc/*/cmdline é legível por outros
+# usuários na janela do curl). Header em arquivo 0600, removido após o uso.
+HDR_FILE="$(mktemp "$CFG_DIR/cache/.hdr.XXXXXX")"
+trap 'rm -f "$HDR_FILE"' EXIT
+printf 'Authorization: Bearer %s\n' "$TOKEN" > "$HDR_FILE"
+chmod 600 "$HDR_FILE"
+
+if ! curl -fsS --max-time 2 "${BASE}/healthz" >/dev/null 2>&1; then
+  systemctl --user start "$ROUTER_SERVICE" >/dev/null 2>&1 || \
+    nohup node "$HOME/.local/share/claude-multirouter/router.mjs" >/dev/null 2>&1 &
+  for _ in $(seq 1 40); do
+    curl -fsS --max-time 2 "${BASE}/healthz" >/dev/null 2>&1 && break
+    sleep 0.25
+  done
+  curl -fsS --max-time 2 "${BASE}/healthz" >/dev/null 2>&1 \
+    || die "roteador nao respondeu em ${BASE} (systemctl --user status ${ROUTER_SERVICE})"
+fi
+
+# Gate de catálogo com retry: um restart acoplado (proxy+roteador) deixa o
+# catálogo sem os modelos Codex por até o fail-TTL de 10s do roteador; morrer
+# na primeira tentativa produzia o falso "modelo ausente" (achado #4). Três
+# tentativas cobrem a janela de revalidação de fundo.
+# Fleet findings #15/#18: um ÚNICO fetch por launch — o snapshot serve ao
+# gate, ao gerador e ao discovery. O token viaja no header-file 0600.
+mkdir -p "$CFG_DIR/cache"
+ok=0
+for attempt in 1 2 3; do
+  curl -fsS --max-time 15 "${BASE}/v1/models?limit=1000" -H @"$HDR_FILE" 2>/dev/null > "$SNAPSHOT" || true
+  catalog=$(python3 -c 'import json,sys
+try:
+    for m in json.load(open(sys.argv[1]))["data"]: print(m["id"])
+except Exception: pass' "$SNAPSHOT" 2>/dev/null || true)
+  # Gate de presença (defaults) + de contagem (4 mains — fleet #6:
+  # parcial passava em silêncio com só os 2 defaults presentes).
+  present=1
+  for m in "$MODEL_MAIN" "$MODEL_FAST"; do
+    grep -qxF "$m" <<<"$catalog" || present=0
+  done
+  n_codex=$(grep -c '^claude-gpt-' <<<"$catalog" 2>/dev/null || echo 0)
+  if [ "$present" = 1 ] && [ "${n_codex:-0}" -ge 4 ]; then ok=1; break; fi
+  [ "$attempt" = 3 ] && break
+  sleep 5
+done
+if [ "$ok" != 1 ]; then
+  systemctl --user is-active claudecodex.service >/dev/null 2>&1 \
+    || die "modelos Codex ausentes do catálogo e claudecodex.service inativo (systemctl --user status claudecodex claude-multirouter)"
+  die "catálogo incompleto após 3 tentativas (${n_codex:-0}/4 modelos Codex; claudecodex ativo; journalctl --user -u claudecodex -n 20)"
+fi
+
+# Escreve as 4 linhas do picker a partir do catálogo autenticado; so na config
+# isolada; só regrava quando o resultado difere do estado atual.
+CLAUDE_CODEX_MODEL="$MODEL_MAIN" CLAUDE_CODEX_CATALOG_FILE="$SNAPSHOT" \
+  python3 "$HOME/.local/share/claude-multirouter/gen-model-overrides.py" 2>/dev/null || true
+
+unset OPENAI_API_KEY OPENAI_BASE_URL ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN 2>/dev/null || true
+
+export CLAUDE_CONFIG_DIR="$CFG_DIR"
+export ANTHROPIC_BASE_URL="$BASE"
+export ANTHROPIC_AUTH_TOKEN="$TOKEN"
+# Model default via FLAG: o settings "model" com alias REVERTE em silêncio
+# para o default da conta e o ANTHROPIC_MODEL env dispara unrecognized_model
+# mesmo com linha de picker. --model vem ANTES dos args do usuário: um --model
+# dele sobrescreve o nosso.
+unset ANTHROPIC_MODEL ANTHROPIC_SMALL_FAST_MODEL 2>/dev/null || true
+# Discovery oficial: o Claude Code consulta GET /v1/models?limit=1000 no
+# gateway e popula o /model (codex + nim + claude).
+export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
+# Folga para o discovery quando o catálogo nasce frio (default 3s, falha em
+# silêncio; exige 2.1.269+ — o instalado é 2.1.296).
+export CLAUDE_CODE_GATEWAY_MODEL_DISCOVERY_TIMEOUT_MS=10000
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+export CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1
+
+# O 2.1.296 com cache/gateway-models.json presente NAO refaz o discovery: usa
+# o cache em silêncio e os modelos ficam listados mas NAO registrados.
+# Regenerar o cache DEDICADO da config isolada a cada subida restaura o
+# "refreshed on each startup" documentado. O cache original em ~/.claude/ é
+# intocado.
+rm -f "$CFG_DIR/cache/gateway-models.json" 2>/dev/null || true
+
+exec "$CLAUDE_REAL_BIN" --model "$MODEL_MAIN" "$@"

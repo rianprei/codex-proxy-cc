@@ -1,0 +1,29 @@
+# NOTICE
+
+This repository is a fork of https://github.com/a1re1/claudecodex
+(forked at upstream commit e71e573). The upstream project declares
+`license = "MIT"` in its Cargo.toml but shipped no LICENSE file; this fork
+adds one (see LICENSE, dual copyright) to make the declared grant explicit.
+
+## Provenance
+
+- Base: a1re1/claudecodex @ e71e573 — Anthropic Messages API proxy for Codex
+  (ChatGPT subscription) models, by Tyler Whitehurst. Upstream auth flow,
+  Anthropic<->Responses translation, SSE streaming and model aliasing are his.
+- Local work (on top of e71e573):
+  - lib/bin split + integration test suite (mock upstream, hermetic)
+  - explicit rejection of unsupported content blocks (incl. nested
+    tool_result.content), bounded upstream retry with quota-exhaustion
+    distinction, terminal retry-after per the Claude Code gateway contract
+  - one-entry-per-base-model catalog (4 mains; effort is a request parameter
+    via output_config.effort), sanitized/redacted diagnostics
+  - stale-while-revalidate catalog + boot prewarm
+  - field regression suite (tests/regression.sh) and research docs
+  - deployment layer (deploy/): launcher, multi-backend router and picker
+    generator for a single-command `claude` experience
+
+## Upstream limitations kept honestly
+
+- The upstream has no CI; this fork adds none yet.
+- Effort levels are whatever the authenticated backend declares; nothing is
+  invented. Context-window limits are UNKNOWN (backend does not expose them).
