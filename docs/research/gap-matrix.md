@@ -22,6 +22,23 @@ Cada linha: achado da frota → estado → fix → prova.
 | P | [baixo] label thinking divergente | exige `budget_tokens` | server.rs |
 | U | [baixo] thinking não-codexenc descartado em silêncio | `tracing::warn` no descarte | translate.rs |
 
+## Ciclo 3 — re-review do fix-commit a4ac930 (24 confirmados, todos corrigidos)
+
+| Achado | Fix |
+|---|---|
+| [alto] fetchT cortava a ponte de abort nos headers | listener mantido vivo no corpo; pump cancela o reader quando o cliente vai embora |
+| [médio] .hdr vazava a cada launch (trap não dispara pós-exec) | rm explícito antes do exec + sweep de vazamentos >10min |
+| [médio] mktemp antes do mkdir | mkdir -p antes do mktemp |
+| [médio] idle-abort fabricava 200 truncado | collect_events devolve api_error explícito |
+| [médio] extractModel lossy em \uXXXX | bail-out para o JSON.parse |
+| [médio] suite "hermética" chamava auth.openai.com | last_refresh fresco no fixture |
+| [médio] aviso do gerador suprimido | stderr liberado |
+| [médio] anthropic catch-all com OAuth | só claude-* real; resto 404 |
+| [médio] cred-test só Bearer | account-id gravado e afirmado |
+| [médio] concorrência sem detectar contaminação | per-body: exatamente um msg-i, nenhum msg-j |
+| [médio] baseline falha aberto | arquivo ausente = bad explícito |
+| [baixo×13] | prewarm backoff; posição no erro; once-guard de warn; nested só text/image; chmod sem symlink; snapshot atômico; grep -c fix; nim fora do gate; docs; TOFU documentado; journal vazio = bad; classe bare-token; PEP 701 |
+
 ## Remanescentes
 
 | Item | Estado | Porquê |

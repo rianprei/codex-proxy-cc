@@ -60,17 +60,20 @@ function routeOf(model) {
   // descascava o id do CATÁLOGO — inverteu a premissa quando o catálogo
   // virou só-base e mandou ids sufixados pra Anthropic (misroute V1).
   const base = m.split(":")[0];
-  if (routed.codex.size > 0) {
-    if (routed.codex.has(m) || routed.codex.has(base)) return "codex";
-    if (routed.nim.has(m) || routed.nim.has(base)) return "nim";
-  }
-  // Default por FORMA: id com cara de Codex vai para o proxy Codex, que é a
-  // autoridade e responde 404 limpo se inválido — fail-closed na camada
-  // certa. NUNCA para a Anthropic com o OAuth do usuário.
+  // Cycle-3 #20: each set is consulted independently — a codex outage must
+  // not disable nim membership routing.
+  if (routed.codex.size > 0 && (routed.codex.has(m) || routed.codex.has(base))) return "codex";
+  if (routed.nim.size > 0 && (routed.nim.has(m) || routed.nim.has(base))) return "nim";
+  // Default por FORMA: id com cara de Codex vai para o proxy Codex (404
+  // limpo se inválido). NUNCA para a Anthropic com o OAuth do usuário.
   const l = base.toLowerCase();
   if (/^(claude-)?(gpt-|codex-)/.test(l)) return "codex";
   if (/^(claude-)?nvidia-/.test(l)) return "nim";
-  return "anthropic";
+  // Cycle-3 #8: the anthropic branch is for REAL claude-* model ids only —
+  // garbage ("", "banana", "claude-") must be rejected, not routed with the
+  // user's OAuth.
+  if (/^claude-[a-z0-9]/.test(l)) return "anthropic";
+  return "reject";
 }
 
 const UPSTREAM = { codex: CODEX_UP, nim: NIM_UP, anthropic: ANTHROPIC_UP };
@@ -88,7 +91,11 @@ async function fetchT(url, opts = {}, ms = 8000) {
     return await fetch(url, { ...opts, signal: ac.signal });
   } finally {
     clearTimeout(t);
-    if (external) external.removeEventListener("abort", onAbort);
+    // Cycle-3 #1 (alto): removing the external listener here cuts the abort
+    // bridge the moment headers arrive — the body phase becomes unabortable.
+    // KEEP the listener: the client's signal dies with the request and is
+    // GC'd with it, so this is not a leak. The bridge now lives for the
+    // whole body phase, which is what fix #4 always claimed.
   }
 }
 
@@ -154,10 +161,10 @@ function extractModel(raw) {
   while (i < head.length && out.length < 256) {
     const c = head[i];
     if (c === '"') return out;
-    if (c === "\\" && i + 1 < head.length) {
-      out += head[i + 1];
-      i += 2;
-      continue;
+    if (c === "\\") {
+      // Cycle-3 #5: the manual unescape is lossy for \uXXXX — bail out and
+      // let the full JSON.parse (which decodes correctly) decide.
+      return null;
     }
     out += c;
     i++;
@@ -323,6 +330,11 @@ const server = http.createServer(async (req, res) => {
     try { model = JSON.parse(raw).model || ""; } catch { model = ""; }
   }
   const kind = routeOf(model);
+  if (kind === "reject") {
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end(JSON.stringify({ type: "error", error: { type: "not_found_error", message: `unsupported model id: ${JSON.stringify(model)}` } }));
+    return;
+  }
   const target = `${UPSTREAM[kind]}${req.url}`;
 
   // Abort do cliente propaga pro upstream: sem isto, um ESC no Claude Code
@@ -353,11 +365,18 @@ const server = http.createServer(async (req, res) => {
     const reader = upstream.body.getReader();
     for (;;) {
       const { done, value } = await reader.read();
-      if (done || res.destroyed) break;
+      if (done) break;
+      if (res.destroyed) {
+        // Cycle-3 #1: client gone mid-body — cancel the upstream stream so
+        // the generation stops instead of running to completion (quota burn).
+        reader.cancel().catch(() => {});
+        break;
+      }
       res.write(Buffer.from(value));
     }
   } catch {
-    // Cliente abortou ou o upstream caiu no meio do SSE: nada mais a dizer.
+    // Cliente abortou (o signal propagado via fetchT derruba o read) ou o
+    // upstream caiu no meio do SSE: nada mais a dizer.
   } finally {
     res.end();
   }

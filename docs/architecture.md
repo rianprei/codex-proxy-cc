@@ -1,8 +1,10 @@
 # Arquitetura — claudecodex (pós-restauração, commit 595c468)
 
 ```
-claude (launcher, ~/.local/bin/claude)
-  ├─ healthz + catálogo (retry 3×) + snapshot → gerador (4 linhas de picker)
+claude (launcher, ~/.local/bin/claude) — mkdir antes do mktemp do header-file 0600
+  (token fora do argv, removido antes do exec; sweep de vazamentos antigos)
+  ├─ healthz + catálogo (retry 3×; gate exige ≥4 modelos-base; snapshot
+  │  atômico tmp+mv) → gerador (4 linhas de picker; stderr visível)
   └─ exec binário real --model claude-gpt-6-astra "$@"
         │  env: CLAUDE_CONFIG_DIR=~/.claude-codex, BASE_URL=:4180,
         │       GATEWAY_MODEL_DISCOVERY=1, discovery cache regenerado por launch

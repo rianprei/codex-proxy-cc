@@ -44,7 +44,7 @@ import json,sys
 try:
     d=json.load(sys.stdin)["data"]
     c=[m for m in d if "gpt-" in m.get("id","") or "codex-" in m.get("id","")]
-    print(f"{len(c)}:{sum(1 for m in c if ":" in m["id"])}")
+    print(f'{len(c)}:{sum(1 for m in c if ":" in m["id"])}')
 except Exception: print("0:1")')
   CCNT="${N%%:*}"; CCOL="${N##*:}"
   [ "${CCNT:-0}" = "4" ] && [ "${CCOL:-1}" = "0" ] \
@@ -82,8 +82,15 @@ fi
 
 echo; echo "== regressao: token em logs =="
 LOGS=$(journalctl --user -u claudecodex.service --no-pager -n 200 2>/dev/null; journalctl --user -u claude-multirouter.service --no-pager -n 200 2>/dev/null)
-if echo "$LOGS" | grep -qEi 'eyJ[A-Za-z0-9_-]{20,}|rt\.1\.|Bearer [A-Za-z0-9]{20,}'; then
+# Cycle-3 #23: empty journal previously passed as "no token found" (fail-open)
+# and the bare LOCAL proxy token matched no pattern class. Require a non-empty
+# subject and grep the literal token value (stays on this machine).
+if [ -z "$LOGS" ]; then
+  bad "journal indisponível/vazio" "não é possível afirmar ausência de token sem examinar linhas"
+elif echo "$LOGS" | grep -qEi 'eyJ[A-Za-z0-9_-]{20,}|rt\.1\.|Bearer [A-Za-z0-9]{20,}'; then
   bad "token no log" "verifique journalctl"
+elif [ -s "$TOKEN_FILE" ] && echo "$LOGS" | grep -qF "$(cat "$TOKEN_FILE")"; then
+  bad "token local do proxy apareceu cru no journal" "verifique journalctl"
 else ok "nenhum token em 400 linhas de journal"
 fi
 
@@ -97,10 +104,18 @@ done
   && ok "wrapper original preservado (claude-pinned)" \
   || bad "claude-pinned sumiu" "backup do wrapper"
 BASE="$HOME/.config/claude-codex/settings.baseline.sha256"
-SUM=$(sha256sum "$HOME/.claude/settings.json" | awk '{print $1}')
+# Cycle-3 #11: a missing file produced an empty SUM and the first run
+# registered a VOID baseline (""=="" forever green). Fail loudly instead.
+[ -f "$HOME/.claude/settings.json" ] \
+  || bad "settings.json do usuário AUSENTE" "a pior violação da preservação — investigue antes de prosseguir"
+SUM=$(sha256sum "$HOME/.claude/settings.json" 2>/dev/null | awk '{print $1}')
+[ -n "$SUM" ] || bad "hash vazio para settings.json" "sha256sum falhou"
 if [ -f "$BASE" ]; then
   if [ "$SUM" = "$(cat "$BASE")" ]; then
-    ok "settings.json do usuário byte-idêntico ao baseline"
+    # Known limitation (cycle-3 #22): TOFU — the baseline lives beside the
+    # guarded file, writable by the same user; this detects accidental drift,
+    # not same-user tampering (that user could edit this script too).
+    ok "settings.json do usuário byte-idêntico ao baseline (TOFU: drift acidental)"
   else
     bad "settings.json mudou" "esperado $(cat "$BASE"), obtido $SUM"
   fi

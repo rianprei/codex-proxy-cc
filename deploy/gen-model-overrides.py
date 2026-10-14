@@ -97,14 +97,18 @@ def main() -> int:
 
     with open(SETTINGS) as f:
         settings = json.load(f)
-    # Ensure 0600 on every load (idempotent), not only on write: the file was
-    # world-readable before the fleet fix, and the early-return path skipped
-    # the chmod.
-    try:
-        if (os.stat(SETTINGS).st_mode & 0o777) != 0o600:
-            os.chmod(SETTINGS, 0o600)
-    except OSError:
-        pass
+    # Ensure 0600 on every load (idempotent), not only on write. Cycle-3
+    # #17: stat/chmod follow symlinks — on a symlinked settings.json, warn
+    # and skip both the chmod and the write (fail-safe, no traversal).
+    if os.path.islink(SETTINGS):
+        print("gen-model-picker: AVISO — settings.json é symlink; não chmodo nem regravo através dele",
+              file=sys.stderr)
+    else:
+        try:
+            if (os.stat(SETTINGS).st_mode & 0o777) != 0o600:
+                os.chmod(SETTINGS, 0o600)
+        except OSError:
+            pass
 
     # Estado desejado, calculado por completo antes de qualquer escrita.
     picker = settings.get("modelPicker") or {}

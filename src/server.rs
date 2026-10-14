@@ -213,18 +213,32 @@ fn validate_content_blocks(value: &Value) -> Result<(), String> {
     }
 
     // Nested blocks: a tool_result carries its own content array that the
-    // translator walks too — validate it as well, or an unsupported block
-    // there is silently dropped by tool_result_text (fleet finding).
+    // translator walks too. IMPORTANT (cycle-3 #16): at the NESTED position
+    // the translator only implements Text and Image — every other name, even
+    // a "supported" one like thinking, is silently dropped by tool_result_text.
+    // Reject by name here so nothing supported-by-name-but-untranslatable
+    // passes. Also recurse into nested tool_results.
+    const NESTED_SUPPORTED: &[&str] = &["text", "image"];
     fn check_blocks(blocks: &[Value], reject: &dyn Fn(&str) -> String) -> Result<(), String> {
+        // Top level: full SUPPORTED_BLOCKS (tool_use/tool_result/thinking are
+        // translatable here). Only the DESCENT into tool_result.content uses
+        // the restricted set — that is where the translator drops silently.
+        check_blocks_inner(blocks, reject, SUPPORTED_BLOCKS)
+    }
+    fn check_blocks_inner(
+        blocks: &[Value],
+        reject: &dyn Fn(&str) -> String,
+        allowed: &[&str],
+    ) -> Result<(), String> {
         for block in blocks {
             if let Some(kind) = block.get("type").and_then(|t| t.as_str()) {
-                if !SUPPORTED_BLOCKS.contains(&kind) {
+                if !allowed.contains(&kind) {
                     return Err(reject(kind));
                 }
             }
             if kind_is_tool_result(block) {
                 if let Some(nested) = block.get("content").and_then(|c| c.as_array()) {
-                    check_blocks(nested, reject)?;
+                    check_blocks_inner(nested, reject, NESTED_SUPPORTED)?;
                 }
             }
         }
@@ -277,11 +291,18 @@ async fn messages(
     let req: MessagesRequest = match serde_json::from_value(value) {
         Ok(r) => r,
         Err(e) => {
+            // Cycle-3 #13: from_value errors carry no line/column. Re-derive
+            // the positioned message with a second pass — error path only, so
+            // the happy path keeps its single-parse win.
+            let positioned = serde_json::from_slice::<MessagesRequest>(&body)
+                .err()
+                .map(|e2| e2.to_string())
+                .unwrap_or_else(|| e.to_string());
             return error_response(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
-                format!("malformed request body: {e}"),
-            )
+                format!("malformed request body: {positioned}"),
+            );
         }
     };
 
@@ -380,7 +401,10 @@ async fn messages(
         }
         res
     } else {
-        let events = collect_events(stream.body, public_model.clone()).await;
+        let (events, _idle_aborted) = collect_events(stream.body, public_model.clone()).await;
+        // On idle abort the last event is an explicit api_error: assemble()
+        // returns Err and the client gets a real error status, never a
+        // truncated 200.
         match translate::assemble(public_model, &events) {
             Ok(msg) => {
                 let mut res = Json(msg).into_response();
@@ -470,7 +494,7 @@ async fn pump_stream(mut body: UpstreamBody, model: String, tx: mpsc::Sender<Str
     }
 }
 
-async fn collect_events(mut body: UpstreamBody, model: String) -> Vec<StreamEvent> {
+async fn collect_events(mut body: UpstreamBody, model: String) -> (Vec<StreamEvent>, bool) {
     let mut parser = SseParser::default();
     let mut translator = ResponsesToAnthropic::new(model);
     let mut events = Vec::new();
@@ -478,12 +502,14 @@ async fn collect_events(mut body: UpstreamBody, model: String) -> Vec<StreamEven
     // sending headers but no bytes would hang the non-streaming request
     // forever — reqwest only has a connect timeout).
     let mut last_activity = Instant::now();
+    let mut idle_aborted = false;
     loop {
         let next = match tokio::time::timeout(PING_INTERVAL, body.next()).await {
             Ok(next) => next,
             Err(_elapsed) => {
                 if last_activity.elapsed() >= MAX_STREAM_IDLE {
                     tracing::warn!("non-streaming upstream idle for {MAX_STREAM_IDLE:?}; aborting");
+                    idle_aborted = true;
                     break;
                 }
                 continue;
@@ -499,7 +525,7 @@ async fn collect_events(mut body: UpstreamBody, model: String) -> Vec<StreamEven
                     }
                 }
                 if translator.finished() {
-                    return events;
+                    return (events, false);
                 }
             }
             Err(e) => {
@@ -509,10 +535,23 @@ async fn collect_events(mut body: UpstreamBody, model: String) -> Vec<StreamEven
                         message: format!("upstream stream error: {e}"),
                     },
                 });
-                return events;
+                return (events, false);
             }
         }
     }
+    // Fleet cycle-3 #4: an idle-aborted stream must NOT fabricate a normal
+    // finish (end_of_stream synthesizes end_turn + MessageStop from partial
+    // events, yielding a 200 with truncated content). Error out instead —
+    // same contract as the streaming path.
+    if idle_aborted {
+        events.push(StreamEvent::Error {
+            error: ApiError {
+                kind: "api_error".into(),
+                message: "upstream stream idle timeout".into(),
+            },
+        });
+        return (events, true);
+    }
     events.extend(translator.end_of_stream());
-    events
+    (events, false)
 }

@@ -123,9 +123,14 @@ pub fn public_list(models: &[UpstreamModel], created_at: &str) -> Vec<PublicMode
         });
     }
     // Fleet finding: a main slug missing from the upstream catalog used to
-    // vanish from the picker in silence. Loud now.
+    // vanish from the picker in silence. Loud now — once per slug per process
+    // (cycle-3 #15: per-request spam in degraded mode).
+    use std::sync::OnceLock;
+    static WARNED: OnceLock<std::sync::Mutex<std::collections::HashSet<&'static str>>> =
+        OnceLock::new();
+    let warned = WARNED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
     for slug in MAIN_SLUGS {
-        if !seen.contains(*slug) {
+        if !seen.contains(*slug) && warned.lock().unwrap().insert(slug) {
             tracing::warn!(slug, "main model missing from upstream catalog");
         }
     }
@@ -137,6 +142,11 @@ struct Cached {
     fetched: Instant,
 }
 
+/// Negative cache (cycle-3 #12/#15): a failed/empty upstream fetch within this
+/// window makes the cold path return immediately instead of refetching —
+/// stops per-request 30s stalls and warn spam while degraded.
+const FETCH_FAILURE_BACKOFF: Duration = Duration::from_secs(30);
+
 pub struct Catalog {
     upstream: Arc<Upstream>,
     // Arc-wrapped so the background stale-while-revalidate task can hold a
@@ -145,6 +155,9 @@ pub struct Catalog {
     /// Serialises upstream refreshes so a cold or expired cache does not fan
     /// out into one `/models` call per concurrent request.
     refresh: Arc<Mutex<()>>,
+    /// Last upstream fetch failure; within the backoff window the cold path
+    /// serves stale/empty immediately (no second 30s stall in a row).
+    last_failure: Arc<RwLock<Option<Instant>>>,
     started_at: String,
 }
 
@@ -154,6 +167,7 @@ impl Catalog {
             upstream,
             cache: Arc::new(RwLock::new(None)),
             refresh: Arc::new(Mutex::new(())),
+            last_failure: Arc::new(RwLock::new(None)),
             started_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         }
     }
@@ -177,20 +191,30 @@ impl Catalog {
         if let Some(models) = self.fresh().await {
             return models;
         }
+        // Negative cache (cycle-3 #12): a fetch failed moments ago — do not
+        // stall this request for another UPSTREAM_TIMEOUT; serve what we have.
+        if let Some(t) = *self.last_failure.read().await {
+            if t.elapsed() < FETCH_FAILURE_BACKOFF {
+                return self.stale().await;
+            }
+        }
         match self.upstream.list_models(UPSTREAM_TIMEOUT).await {
             Ok(models) if !models.is_empty() => {
                 *self.cache.write().await = Some(Cached {
                     models: models.clone(),
                     fetched: Instant::now(),
                 });
+                *self.last_failure.write().await = None;
                 models
             }
             Ok(_) => {
                 tracing::warn!("upstream returned an empty model list");
+                *self.last_failure.write().await = Some(Instant::now());
                 self.stale().await
             }
             Err(e) => {
                 tracing::warn!(error = %e, "model list fetch failed; serving cached list");
+                *self.last_failure.write().await = Some(Instant::now());
                 self.stale().await
             }
         }
@@ -215,6 +239,7 @@ impl Catalog {
             if already_fresh {
                 return;
             }
+            // Negative-cache backoff also applies to background refreshes.
             match upstream.list_models(UPSTREAM_TIMEOUT).await {
                 Ok(models) if !models.is_empty() => {
                     *cache.write().await = Some(Cached {

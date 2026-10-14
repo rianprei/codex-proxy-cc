@@ -22,6 +22,16 @@ pub fn write_fake_codex_home(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("claudecodex-test-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create temp codex home");
+    // Cycle-3 #6: last_refresh must be FRESH — a stale date made every
+    // credentials() call attempt a REAL refresh POST to auth.openai.com
+    // (the "hermetic" suite relied on that network call failing).
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let fresh = chrono::DateTime::from_timestamp(secs as i64, 0)
+        .unwrap()
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let auth = serde_json::json!({
         "auth_mode": "chatgpt",
         "tokens": {
@@ -29,7 +39,7 @@ pub fn write_fake_codex_home(tag: &str) -> PathBuf {
             "refresh_token": "test-refresh-token",
             "account_id": "test-account-id"
         },
-        "last_refresh": "2026-01-01T00:00:00Z"
+        "last_refresh": fresh
     });
     std::fs::write(dir.join("auth.json"), auth.to_string()).expect("write auth.json");
     dir
@@ -40,6 +50,8 @@ pub fn write_fake_codex_home(tag: &str) -> PathBuf {
 pub struct Recorded {
     pub bodies: Mutex<Vec<String>>,
     pub auth_headers: Mutex<Vec<String>>,
+    /// chatgpt-account-id values sent upstream (cycle-3 #9).
+    pub account_headers: Mutex<Vec<String>>,
     pub hits: AtomicU32,
 }
 
@@ -196,6 +208,14 @@ async fn mock_responses(
     if let Some(a) = headers.get("authorization") {
         m.recorded
             .auth_headers
+            .lock()
+            .unwrap()
+            .push(a.to_str().unwrap_or("<binary>").to_string());
+    }
+    // Cycle-3 #9: the account header is part of the credential contract.
+    if let Some(a) = headers.get("chatgpt-account-id") {
+        m.recorded
+            .account_headers
             .lock()
             .unwrap()
             .push(a.to_str().unwrap_or("<binary>").to_string());
