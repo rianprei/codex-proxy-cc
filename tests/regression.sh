@@ -39,13 +39,13 @@ if curl -fsS --max-time 3 "$ROUTER/healthz" >/dev/null 2>&1; then
   [ "$C" = "403" ] && ok "Host de rebinding -> 403" || bad "Host evil -> $C" "esperado 403"
   C=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -X POST "$ROUTER/v1/complete" -H @"$HDR" -H 'Content-Type: application/json' -d '{}')
   [ "$C" = "404" ] && ok "path fora da allowlist -> 404" || bad "path livre -> $C" "esperado 404"
-  N=$(curl -fsS --max-time 40 "$ROUTER/v1/models?limit=1000" -H @"$HDR" 2>/dev/null | python3 -c '
+  N=$(curl -fsS --max-time 40 "$ROUTER/v1/models?limit=1000" -H @"$HDR" 2>/dev/null | python3 -c "
 import json,sys
 try:
-    d=json.load(sys.stdin)["data"]
-    c=[m for m in d if "gpt-" in m.get("id","") or "codex-" in m.get("id","")]
-    print(f'{len(c)}:{sum(1 for m in c if ":" in m["id"])}')
-except Exception: print("0:1")')
+    d=json.load(sys.stdin)['data']
+    c=[m for m in d if 'gpt-' in m.get('id','') or 'codex-' in m.get('id','')]
+    print('%d:%d' % (len(c), sum(1 for m in c if ':' in m['id'])))
+except Exception: print('0:1')")
   CCNT="${N%%:*}"; CCOL="${N##*:}"
   [ "${CCNT:-0}" = "4" ] && [ "${CCOL:-1}" = "0" ] \
     && ok "catálogo: 4 modelos-base, 0 variantes de esforço" \
