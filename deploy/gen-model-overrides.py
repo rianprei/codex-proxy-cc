@@ -70,31 +70,39 @@ def load_catalog():
 
 def main() -> int:
     data = load_catalog()
-    if data is None:
-        return 0  # nunca apaga o que existe por catálogo indisponível
+    catalog_ids: set[str] = set()
+    if data is not None:
+        catalog_ids = {m.get("id", "") for m in data.get("data", [])}
 
+    # Sempre emite uma linha por MAIN_MODEL, independentemente do catálogo
+    # upstream já expor o slug. O picker do Claude Code só precisa da row
+    # (behavesAs declara capacidades; o model enviado é o slug Codex). O
+    # aviso abaixo nomeia honestamente o que ainda não está disponível para
+    # inferência — sem deixar o picker incompleto.
     rows = []
-    for m in data.get("data", []):
-        base = m.get("id", "").removeprefix("claude-")
-        if base in MAIN_MODELS:
-            label, behaves = MAIN_MODELS[base]
-            rows.append({
-                "model": m["id"],
-                "label": label,
-                "behavesAs": behaves,
-                "description": "ChatGPT Pro via Codex — esforço ajustável no controle nativo",
-            })
-    catalog_ids = {m.get("id", "") for m in data.get("data", [])}
+    for base in MAIN_MODELS:
+        label, behaves = MAIN_MODELS[base]
+        full_id = f"claude-{base}"
+        rows.append({
+            "model": full_id,
+            "label": label,
+            "behavesAs": behaves,
+            "description": "ChatGPT Pro via Codex — esforço ajustável no controle nativo",
+        })
+
     missing = [base for base in MAIN_MODELS
                if f"claude-{base}" not in catalog_ids]
     if missing:
         # Fleet finding: catálogo parcial degradava em silêncio através de
-        # todas as camadas. Agora é nomeado, alto e claro.
+        # todas as camadas. Agora é nomeado, alto e claro. O picker fica
+        # COMPLETO mesmo assim — apenas a inferência nos modelos ausentes
+        # falhará até o backend os expor.
         print(f"gen-model-picker: AVISO — modelo(s) principal(is) ausente(s) do catálogo: "
-              f"{', '.join(missing)} (picker ficará INCOMPLETO)",
+              f"{', '.join(missing)} (picker completo; inferência indisponível até o backend expor)",
               file=sys.stderr)
+
     if not rows:
-        print("gen-model-picker: nenhum modelo principal no catálogo; nada a fazer",
+        print("gen-model-picker: nenhum modelo principal configurado; nada a fazer",
               file=sys.stderr)
         return 0
 
