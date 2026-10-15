@@ -135,7 +135,24 @@ pub fn retry_after_delay_for_test(headers: &HeaderMap, cap: Duration) -> Duratio
 impl Upstream {
     pub fn new(base: String, auth: Arc<AuthStore>) -> Result<Self> {
         let http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(20))
+            // Conexão rápida: loopback-local para o upstream, falha logo se
+            // não houver caminho de rede.
+            .connect_timeout(Duration::from_secs(2))
+            // Teto global por requisição. list_models() sobrescreve com seu
+            // próprio valor; responses() com 600s por ser streaming longo.
+            .timeout(Duration::from_secs(30))
+            // Mantém conexões HTTP/2 quentes entre chamadas ao upstream,
+            // evitando o custo de novo handshake TLS + ALPN por request.
+            .pool_idle_timeout(Duration::from_secs(90))
+            // chatgpt.com fala HTTP/2: pular ALPN salva uma ida-e-volta
+            // por conexão nova.
+            .http2_prior_knowledge()
+            // O proxy encaminha corpos já compactados pelo upstream; não há
+            // ganho em compactar de novo do lado do cliente e a descompactação
+            // gasta CPU em cada chunk de stream.
+            .no_gzip()
+            .no_deflate()
+            .no_brotli()
             .build()
             .context("build http client")?;
         Ok(Self {
@@ -240,6 +257,10 @@ impl Upstream {
                 .post(&url)
                 .headers(headers)
                 .json(req)
+                // Streaming pode durar minutos (reasoning longo): o teto de
+                // 30s do client se aplica só ao receber os headers; estende
+                // aqui para cobrir todo o corpo sem matar a requisição.
+                .timeout(Duration::from_secs(600))
                 .send()
                 .await
                 .context("POST /responses")?;

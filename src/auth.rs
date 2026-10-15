@@ -96,7 +96,14 @@ impl AuthStore {
         // The credentials mutex is held across refresh calls, so a stalled
         // request to the auth server must not block the proxy indefinitely.
         let http = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(2))
             .timeout(Duration::from_secs(30))
+            // Refresh é assíncrono e raro: mantém poucas conexões quentes.
+            .pool_idle_timeout(Duration::from_secs(30))
+            .http2_prior_knowledge()
+            .no_gzip()
+            .no_deflate()
+            .no_brotli()
             .build()
             .context("build auth http client")?;
         Ok(Self {

@@ -62,7 +62,7 @@ fn chain_from_env() -> Vec<String> {
     parse_chain(&std::env::var("CLAUDE_CODEX_CHAIN").unwrap_or_default())
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let default_filter = if cli.verbose {

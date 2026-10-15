@@ -611,10 +611,11 @@ async fn messages(
         }
     }
 
-    let public_model = req.model.clone();
+    let public_model = &req.model;
     if req.stream {
         let (tx, rx) = mpsc::channel::<String>(64);
-        tokio::spawn(pump_stream(stream.body, public_model, tx));
+        // Spawned task needs an owned model string; clone only here.
+        tokio::spawn(pump_stream(stream.body, public_model.to_string(), tx));
         let body =
             Body::from_stream(ReceiverStream::new(rx).map(Ok::<_, std::convert::Infallible>));
         let mut res = Response::new(body);
@@ -629,7 +630,7 @@ async fn messages(
         }
         res
     } else {
-        let (events, _idle_aborted) = collect_events(stream.body, public_model.clone()).await;
+        let (events, _idle_aborted) = collect_events(stream.body, public_model).await;
         // On idle abort the last event is an explicit api_error: assemble()
         // returns Err and the client gets a real error status, never a
         // truncated 200.
@@ -660,7 +661,7 @@ type UpstreamBody =
 /// and interleaving `ping` frames while the upstream is silent.
 async fn pump_stream(mut body: UpstreamBody, model: String, tx: mpsc::Sender<String>) {
     let mut parser = SseParser::default();
-    let mut translator = ResponsesToAnthropic::new(model);
+    let mut translator = ResponsesToAnthropic::new(&model);
     let ping = StreamEvent::Ping.to_sse();
     let mut last_activity = Instant::now();
     loop {
@@ -722,7 +723,7 @@ async fn pump_stream(mut body: UpstreamBody, model: String, tx: mpsc::Sender<Str
     }
 }
 
-async fn collect_events(mut body: UpstreamBody, model: String) -> (Vec<StreamEvent>, bool) {
+async fn collect_events(mut body: UpstreamBody, model: &str) -> (Vec<StreamEvent>, bool) {
     let mut parser = SseParser::default();
     let mut translator = ResponsesToAnthropic::new(model);
     let mut events = Vec::new();

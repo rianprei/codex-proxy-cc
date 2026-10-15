@@ -425,11 +425,20 @@ impl SseParser {
         self.buf.extend_from_slice(chunk);
         let mut frames = Vec::new();
         while let Some((frame_bytes, sep_len)) = find_frame_end(&self.buf) {
-            let frame = self.buf.drain(..frame_bytes + sep_len).collect::<Vec<u8>>();
-            let text = String::from_utf8_lossy(&frame[..frame_bytes]);
-            if let Some(f) = parse_frame(&text) {
+            // Zero-copy: parse directly from the buffer slice instead of
+            // draining into a fresh Vec<u8> per frame. SSE payloads are UTF-8
+            // JSON; invalid UTF-8 frames are dropped.
+            let text = match std::str::from_utf8(&self.buf[..frame_bytes]) {
+                Ok(t) => t,
+                Err(_) => {
+                    let _ = self.buf.drain(..frame_bytes + sep_len);
+                    continue;
+                }
+            };
+            if let Some(f) = parse_frame(text) {
                 frames.push(f);
             }
+            let _ = self.buf.drain(..frame_bytes + sep_len);
         }
         frames
     }
@@ -517,9 +526,9 @@ fn parse_usage(usage: &Value) -> Usage {
 }
 
 impl ResponsesToAnthropic {
-    pub fn new(model: String) -> Self {
+    pub fn new(model: &str) -> Self {
         Self {
-            model,
+            model: model.to_string(),
             msg_id: format!("msg_{}", uuid::Uuid::new_v4().simple()),
             started: false,
             finished: false,
@@ -888,8 +897,8 @@ impl ResponsesToAnthropic {
 }
 
 /// Fold stream events into a complete (non-streaming) message.
-pub fn assemble(model: String, events: &[StreamEvent]) -> Result<MessageResponse, ApiError> {
-    let mut msg = MessageResponse::new(model);
+pub fn assemble(model: &str, events: &[StreamEvent]) -> Result<MessageResponse, ApiError> {
+    let mut msg = MessageResponse::new(model.to_string());
     let mut json_buf: BTreeMap<usize, String> = BTreeMap::new();
     for ev in events {
         match ev {
@@ -1080,7 +1089,7 @@ mod tests {
     }
 
     fn drive(events: &[Value]) -> Vec<StreamEvent> {
-        let mut sm = ResponsesToAnthropic::new("claude-gpt-5.5".into());
+        let mut sm = ResponsesToAnthropic::new("claude-gpt-5.5");
         let mut out = Vec::new();
         for e in events {
             out.extend(sm.handle(e));
@@ -1121,7 +1130,7 @@ mod tests {
                 "message_stop"
             ]
         );
-        let msg = assemble("claude-gpt-5.5".into(), &out).expect("assembles");
+        let msg = assemble("claude-gpt-5.5", &out).expect("assembles");
         assert_eq!(
             msg.content,
             vec![OutBlock::Text {
@@ -1157,7 +1166,7 @@ mod tests {
             StreamEvent::ContentBlockStart { index: 0, content_block: OutBlock::ToolUse { id, name, .. } }
                 if id == "call_9" && name == "clock"
         ));
-        let msg = assemble("m".into(), &out).expect("assembles");
+        let msg = assemble("m", &out).expect("assembles");
         assert_eq!(msg.stop_reason.as_deref(), Some("tool_use"));
         assert_eq!(
             msg.content,
@@ -1182,7 +1191,7 @@ mod tests {
             .filter(|e| matches!(e, StreamEvent::ContentBlockDelta { .. }))
             .collect();
         assert_eq!(deltas.len(), 1);
-        let msg = assemble("m".into(), &out).expect("assembles");
+        let msg = assemble("m", &out).expect("assembles");
         assert_eq!(msg.content.len(), 1);
         assert!(
             matches!(&msg.content[0], OutBlock::ToolUse { input, .. } if input == &json!({"a":1}))
@@ -1207,7 +1216,7 @@ mod tests {
             json!({"type":"some.future.event","weird":[1,2,{"x":null}]}),
         ];
         let out = drive(&events);
-        let msg = assemble("m".into(), &out).expect("assembles");
+        let msg = assemble("m", &out).expect("assembles");
         assert_eq!(
             msg.content,
             vec![
@@ -1242,14 +1251,14 @@ mod tests {
         assert!(
             matches!(out.last(), Some(StreamEvent::Error { error }) if error.message == "boom")
         );
-        assert!(assemble("m".into(), &out).is_err());
+        assert!(assemble("m", &out).is_err());
 
         let out = drive(&[
             json!({"type":"response.created"}),
             json!({"type":"response.output_text.delta","output_index":0,"delta":"partial"}),
             json!({"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"},"usage":{}}}),
         ]);
-        let msg = assemble("m".into(), &out).expect("assembles");
+        let msg = assemble("m", &out).expect("assembles");
         assert_eq!(msg.stop_reason.as_deref(), Some("max_tokens"));
         assert_eq!(msg.content.len(), 1);
     }
