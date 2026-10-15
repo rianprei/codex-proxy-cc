@@ -71,6 +71,13 @@ pub struct MockUpstream {
     /// When set, transient failures return this body instead of the default,
     /// so tests can shape quota-exhaustion responses.
     pub quota_body: Arc<tokio::sync::Mutex<Option<String>>>,
+    /// When set, /responses requests whose body contains this slug fail
+    /// with `fail_model_status` (plus `quota_body` when present),
+    /// persistently and independent of the transient budget — the
+    /// per-model failure driver for chain fallback tests. Unset keeps the
+    /// existing behavior.
+    pub fail_model: Arc<Mutex<Option<String>>>,
+    pub fail_model_status: StatusCode,
 }
 
 impl MockUpstream {
@@ -83,6 +90,8 @@ impl MockUpstream {
             fail_status: StatusCode::TOO_MANY_REQUESTS,
             retry_after: "0",
             quota_body: Arc::new(tokio::sync::Mutex::new(None)),
+            fail_model: Arc::new(Mutex::new(None)),
+            fail_model_status: StatusCode::TOO_MANY_REQUESTS,
         }
     }
 
@@ -101,6 +110,16 @@ impl MockUpstream {
         self.fail_first.store(n, Ordering::SeqCst);
         self.fail_status = status;
         self.retry_after = retry_after;
+        self
+    }
+
+    /// Fail every /responses request whose body contains `slug` with
+    /// `status`, persistently and regardless of the transient budget: only
+    /// that model breaks, so chain tests can fail the selected model (or a
+    /// single candidate) without touching the rest of the chain.
+    pub fn with_model_failures(mut self, slug: &str, status: StatusCode) -> Self {
+        *self.fail_model.lock().unwrap() = Some(slug.to_string());
+        self.fail_model_status = status;
         self
     }
 
@@ -140,13 +159,26 @@ impl MockUpstream {
         (addr, self, handle)
     }
 
-    /// Point the real proxy at this mock.
+    /// Point the real proxy at this mock (no fallback chain).
     pub async fn state(&self, addr: SocketAddr, tag: &str, token: Option<String>) -> AppState {
+        self.state_with_chain(addr, tag, token, Vec::new()).await
+    }
+
+    /// Same, with an explicit fallback chain — the `CLAUDE_CODEX_CHAIN`
+    /// equivalent, already parsed (slugs in preference order).
+    pub async fn state_with_chain(
+        &self,
+        addr: SocketAddr,
+        tag: &str,
+        token: Option<String>,
+        chain: Vec<String>,
+    ) -> AppState {
         claudecodex::build_state(
             &format!("http://{addr}"),
             &write_fake_codex_home(tag),
             token,
             "medium",
+            chain,
         )
         .await
         .expect("build proxy state")
@@ -204,6 +236,11 @@ async fn mock_responses(
     body: String,
 ) -> Response {
     m.recorded.hits.fetch_add(1, Ordering::SeqCst);
+    // Per-model failures (chain tests): decide BEFORE `body` is moved into
+    // the recorded log below. Only requests whose body mentions the armed
+    // slug fail; everything else flows to the normal paths.
+    let fail_model = m.fail_model.lock().unwrap().clone();
+    let model_failure = fail_model.is_some_and(|s| body.contains(s.as_str()));
     m.recorded.bodies.lock().unwrap().push(body);
     if let Some(a) = headers.get("authorization") {
         m.recorded
@@ -219,6 +256,21 @@ async fn mock_responses(
             .lock()
             .unwrap()
             .push(a.to_str().unwrap_or("<binary>").to_string());
+    }
+    // The per-model directive is budget-independent and persistent.
+    if model_failure {
+        let failure_body = m
+            .quota_body
+            .lock()
+            .await
+            .clone()
+            .unwrap_or_else(|| r#"{"error":{"message":"transient"}}"#.to_string());
+        return Response::builder()
+            .status(m.fail_model_status)
+            .header("retry-after", m.retry_after)
+            .header("content-type", "application/json")
+            .body(Body::from(failure_body))
+            .unwrap();
     }
     // Consume the transient-failure budget before applying the steady status.
     if m.fail_first.load(Ordering::SeqCst) > 0 {

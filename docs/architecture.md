@@ -33,6 +33,10 @@ Decisões com prova:
   MAIS (26 vs 20 skills).
 - Fail-closed em toda a cadeia: 429 de quota = erro terminal, zero fallback
   para Anthropic/NIM; ids codex-shaped não conhecidos → proxy Codex (404 limpo).
+  Opt-in (`CLAUDE_CODEX_CHAIN`): fallback estritamente same-provider/same-account
+  — slugs Codex em ordem de preferência, disparado só por 429/5xx não-quota,
+  quota nunca encadeia (terminal imediato), cooldown de 60s por slug candidato,
+  cada switch em `warn` (original, status, novo slug, restantes); vazio = desligado.
 
 Limites declarados: context window UNKNOWN (backend não expõe); PDF/document
 rejeitado explicitamente (`input_modalities` = text+image).

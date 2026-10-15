@@ -39,6 +39,25 @@ fn home_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// Split a `CLAUDE_CODEX_CHAIN` value into Codex slugs, preserving order,
+/// trimming whitespace and dropping empty entries (so a trailing comma or a
+/// whitespace-only value cannot create phantom candidates).
+fn parse_chain(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The opt-in same-provider fallback chain: comma-separated Codex slugs in
+/// preference order. Parsed ONCE at startup; per-candidate validation (catalog
+/// membership) happens lazily per request. Unset or empty = feature off,
+/// behavior byte-identical to the no-chain build.
+fn chain_from_env() -> Vec<String> {
+    parse_chain(&std::env::var("CLAUDE_CODEX_CHAIN").unwrap_or_default())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -52,11 +71,21 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let codex_home = cli.codex_home.unwrap_or_else(|| home_dir().join(".codex"));
+    let chain = chain_from_env();
+    // Loud by design: a configured chain changes what serves a request, so
+    // the operator must see it in the journal at startup.
+    if !chain.is_empty() {
+        tracing::info!(
+            chain = %chain.join(","),
+            "same-provider fallback chain enabled (opt-in)"
+        );
+    }
     let state = claudecodex::build_state(
         &cli.upstream_base,
         &codex_home,
         cli.auth_token.clone(),
         &cli.default_reasoning_effort,
+        chain,
     )
     .await?;
 
@@ -86,4 +115,26 @@ async fn main() -> anyhow::Result<()> {
     );
     axum::serve(listener, server::router(state)).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_chain;
+
+    #[test]
+    fn chain_env_empty_or_blank_yields_no_chain() {
+        assert!(parse_chain("").is_empty());
+        assert!(parse_chain("   ").is_empty());
+        assert!(parse_chain(",,,").is_empty());
+    }
+
+    #[test]
+    fn chain_env_parses_in_order_with_trimming() {
+        assert_eq!(
+            parse_chain(" gpt-6-astra , gpt-5.6-sol ,,gpt-5.6-terra\t"),
+            vec!["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra"]
+        );
+        // A trailing comma is a config typo, not a fourth candidate.
+        assert_eq!(parse_chain("a,b,"), vec!["a", "b"]);
+    }
 }

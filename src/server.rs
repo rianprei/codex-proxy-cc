@@ -1,6 +1,7 @@
 //! axum HTTP surface: the Anthropic Messages API as Claude Code speaks it.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
@@ -18,9 +19,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::anthropic::{ApiError, ErrorBody, MessagesRequest, StreamEvent};
 use crate::models::Catalog;
 use crate::translate::{self, ResponsesToAnthropic, SseParser};
-use crate::upstream::{Upstream, UpstreamError};
+use crate::upstream::{ResponsesRequest, ResponsesStream, Upstream, UpstreamError};
 
-/// Interval between SSE `ping` frames while the upstream is quiet.
 /// Interval between SSE `ping` frames while the upstream is quiet.
 /// 5s (ported from claude-nim): shorter pings sit further inside Claude
 /// Code's streaming idle watchdog, so long silent reasoning phases never
@@ -28,6 +28,9 @@ use crate::upstream::{Upstream, UpstreamError};
 const PING_INTERVAL: Duration = Duration::from_secs(5);
 /// Give up on an upstream stream that has sent nothing for this long.
 const MAX_STREAM_IDLE: Duration = Duration::from_secs(600);
+/// How long a chain candidate that failed with a 429/5xx is skipped by the
+/// circuit breaker (ported from claude-nim: one 60s window, per slug).
+const CHAIN_COOLDOWN: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub struct AppState {
@@ -35,6 +38,18 @@ pub struct AppState {
     pub upstream: Arc<Upstream>,
     pub catalog: Arc<Catalog>,
     pub default_effort: String,
+    /// Opt-in same-provider fallback chain: Codex slugs in preference order,
+    /// parsed once at startup from `CLAUDE_CODEX_CHAIN`. EMPTY = the feature
+    /// is off and behavior must be byte-identical to the no-chain build.
+    /// The chain only ever runs after the selected model failed with a
+    /// transient upstream error — it is strictly same-provider and
+    /// same-account, never a paid API or another provider.
+    pub chain: Arc<Vec<String>>,
+    /// Circuit breaker state for chain candidates, keyed by bare Codex slug:
+    /// slug -> instant until which the slug is skipped. Only CANDIDATES are
+    /// keyed here; the user's selected model never enters cooldown (its
+    /// failure either surfaces or flows into the chain).
+    pub chain_cooldowns: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -177,6 +192,240 @@ fn upstream_error_response(err: UpstreamError) -> Response {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Opt-in same-provider chain fallback (CLAUDE_CODEX_CHAIN, ported from the
+// claude-nim gateway design: chains like ultra→super→nano with a 60s
+// per-slug cooldown). The hard contract is untouched: the proxy NEVER falls
+// back to a paid API or another provider — every candidate is a Codex slug
+// routed through the same upstream with the same account. An EMPTY chain
+// (env unset/empty) disables the feature entirely.
+// ---------------------------------------------------------------------------------------------
+
+/// Is `slug` inside its circuit-breaker window?
+fn in_cooldown(cooldowns: &Mutex<HashMap<String, Instant>>, slug: &str) -> bool {
+    cooldowns
+        .lock()
+        .expect("chain cooldown map")
+        .get(slug)
+        .is_some_and(|until| Instant::now() < *until)
+}
+
+/// Open (or refresh) the circuit-breaker window for `slug`.
+fn set_cooldown(cooldowns: &Mutex<HashMap<String, Instant>>, slug: &str) {
+    cooldowns
+        .lock()
+        .expect("chain cooldown map")
+        .insert(slug.to_string(), Instant::now() + CHAIN_COOLDOWN);
+}
+
+/// Compact, journal-safe description of a failed attempt for the loud
+/// switch log: the HTTP status for upstream errors, the transport error
+/// otherwise. Never the body (bodies can be large and are not redacted).
+fn failure_brief(err: &UpstreamError) -> String {
+    match err {
+        UpstreamError::Status { status, .. } => status.as_u16().to_string(),
+        UpstreamError::Other(e) => format!("transport: {e}"),
+    }
+}
+
+/// Resolve effort for `slug`, build the upstream request and emit the
+/// per-attempt journal lines. Runs once for the selected model and once for
+/// every chain candidate, each time with the slug actually used, so the
+/// journal shows the real chain of attempts.
+///
+/// `id_suffix_effort` is the `:<effort>` the client put on the requested
+/// model id. Chain candidates are bare slugs and pass None: their effort
+/// comes from the request-level channels (`output_config.effort` /
+/// `thinking`) or the CLI default, clamped to what the CANDIDATE declares —
+/// never the selected model's suffix, which may not exist there.
+async fn build_attempt(
+    state: &AppState,
+    req: &MessagesRequest,
+    request_effort: Option<&str>,
+    session_id: Option<&str>,
+    slug: &str,
+    id_suffix_effort: Option<&str>,
+) -> ResponsesRequest {
+    let upstream_model = state.catalog.model(slug).await;
+    let effort = translate::choose_effort(
+        request_effort,
+        id_suffix_effort,
+        req.thinking.as_ref(),
+        &state.default_effort,
+        upstream_model.as_ref(),
+    );
+    let upstream_req = translate::anthropic_to_responses(req, slug, &effort, session_id);
+    // Diagnostic chain (redacted: ids and effort levels only, never prompts,
+    // tokens or credentials): selected id -> backend slug -> effort the client
+    // sent (with its source) -> effort forwarded upstream. The raw client
+    // string is sanitized: only declared effort levels are printable, so a
+    // hostile output_config can never forge or flood the log.
+    let effort_source = if request_effort.is_some() {
+        "request"
+    } else if id_suffix_effort.is_some() {
+        "id_suffix"
+    } else if req
+        .thinking
+        .as_ref()
+        .map(|t| t.kind == "enabled" && t.budget_tokens.is_some())
+        .unwrap_or(false)
+    {
+        "thinking"
+    } else {
+        "default"
+    };
+    let effort_received = request_effort.or(id_suffix_effort).unwrap_or("-");
+    let printable = if effort_received == "-" || translate::is_known_effort(effort_received) {
+        effort_received
+    } else {
+        "<invalid>"
+    };
+    tracing::info!(
+        selected_model = %req.model,
+        backend_slug = %slug,
+        effort_received = %format!("{effort_source}:{printable}"),
+        effort_sent = %effort,
+        "model resolution"
+    );
+    tracing::debug!(
+        model = %slug,
+        %effort,
+        stream = req.stream,
+        tools = req.tools.len(),
+        input_items = upstream_req.input.len(),
+        "forwarding to codex"
+    );
+    upstream_req
+}
+
+/// Outcome of the post-failure chain walk.
+enum ChainOutcome {
+    /// A chain candidate answered; the response streams from it.
+    Stream(ResponsesStream),
+    /// Nothing left to try (chain off, non-trigger error, quota, or chain
+    /// exhausted) — the terminal error response for the client.
+    Terminal(Response),
+}
+
+/// Try the fallback chain after the selected model failed with `first_err`.
+///
+/// Guarantees (opt-in feature; EMPTY chain = all of this is skipped and the
+/// error surfaces exactly as before the feature existed):
+///
+/// - Trigger: `UpstreamError::Status` with 429/5xx that is NOT quota
+///   exhaustion. Quota means the ACCOUNT is out — every model would fail
+///   identically — so the terminal error surfaces immediately on ANY attempt,
+///   selected or candidate, and the walk stops.
+/// - Selection: chain order, starting AFTER the selected slug. A selected
+///   slug not in the chain does not consume the walk. Every candidate must
+///   resolve in the catalog; a bad entry (operator typo in the env var) is
+///   skipped with a loud warn, never silently.
+/// - Circuit breaker: a candidate that failed with 429/5xx is skipped for
+///   CHAIN_COOLDOWN on subsequent requests. The selected model is never
+///   keyed — it is always attempted first.
+/// - Loudness: every switch names the original slug, the failing status,
+///   the new slug and the remaining candidates; exhaustion is logged too.
+/// - No looping: each request walks the chain at most once and surfaces the
+///   LAST error through the existing error mapping.
+async fn run_chain(
+    state: &AppState,
+    req: &MessagesRequest,
+    request_effort: Option<&str>,
+    session_id: Option<&str>,
+    selected_slug: &str,
+    first_err: UpstreamError,
+) -> ChainOutcome {
+    // Trigger guard: only a transient upstream Status (429/5xx) starts the
+    // walk — never quota exhaustion, never other transport/4xx errors.
+    let triggers = matches!(
+        &first_err,
+        UpstreamError::Status { status, body }
+            if (*status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error())
+                && !crate::upstream::is_quota_exhaustion(body)
+    );
+    if !triggers || state.chain.is_empty() {
+        return ChainOutcome::Terminal(upstream_error_response(first_err));
+    }
+    // Candidates: chain entries AFTER the selected slug (which was just
+    // attempted). A selected slug not in the chain leaves the walk intact
+    // and the chain applies from the top.
+    let start = state
+        .chain
+        .iter()
+        .position(|s| s == selected_slug)
+        .map_or(0, |i| i + 1);
+    let candidates = &state.chain[start..];
+
+    let mut last_err = first_err;
+    for (i, slug) in candidates.iter().enumerate() {
+        // Circuit breaker: skip a candidate that failed inside the window —
+        // it would fail the same way again.
+        if in_cooldown(&state.chain_cooldowns, slug) {
+            tracing::warn!(slug, "chain candidate in cooldown; skipping");
+            continue;
+        }
+        // Validity: the candidate must exist in the catalog (same upstream,
+        // same account). A bad entry is an operator config mistake — loud,
+        // then skipped.
+        if state
+            .catalog
+            .resolve(&format!("claude-{slug}"))
+            .await
+            .is_none()
+        {
+            tracing::warn!(slug, "chain candidate not in catalog; skipping");
+            continue;
+        }
+        // LOUD switch record: what was asked, what failed and how, what we
+        // switch to, what is left. Never silent.
+        let remaining = if i + 1 < candidates.len() {
+            candidates[i + 1..].join(",")
+        } else {
+            "-".to_string()
+        };
+        tracing::warn!(
+            original_slug = %selected_slug,
+            failing_status = %failure_brief(&last_err),
+            new_slug = %slug,
+            remaining_candidates = %remaining,
+            "chain fallback: switching model"
+        );
+        let upstream_req = build_attempt(state, req, request_effort, session_id, slug, None).await;
+        match state.upstream.responses(&upstream_req).await {
+            Ok(s) => return ChainOutcome::Stream(s),
+            Err(e) => {
+                let chain_failure = matches!(
+                    &e,
+                    UpstreamError::Status { status, .. }
+                        if *status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+                );
+                let quota = matches!(
+                    &e,
+                    UpstreamError::Status { status, body }
+                        if *status == StatusCode::TOO_MANY_REQUESTS
+                            && crate::upstream::is_quota_exhaustion(body)
+                );
+                if chain_failure {
+                    // Circuit breaker: this slug just failed 429/5xx.
+                    set_cooldown(&state.chain_cooldowns, slug);
+                }
+                if quota {
+                    // Account-level terminal state on ANY attempt: stop the
+                    // walk at once and surface the terminal quota error.
+                    return ChainOutcome::Terminal(upstream_error_response(e));
+                }
+                last_err = e;
+            }
+        }
+    }
+    tracing::warn!(
+        original_slug = %selected_slug,
+        chain = %state.chain.join(","),
+        "chain exhausted; surfacing last upstream error"
+    );
+    ChainOutcome::Terminal(upstream_error_response(last_err))
+}
+
 /// Content block types this proxy can faithfully translate to the Codex
 /// Responses API. Anything else must fail loudly, not silently vanish.
 const SUPPORTED_BLOCKS: &[&str] = &[
@@ -317,65 +566,31 @@ async fn messages(
             format!("model not found: {}", req.model),
         );
     };
-    let upstream_model = state.catalog.model(&resolved.slug).await;
     let request_effort = req
         .output_config
         .as_ref()
         .and_then(|o| o.effort.as_deref())
         .filter(|e| !e.is_empty());
-    let effort = translate::choose_effort(
-        request_effort,
-        resolved.effort.as_deref(),
-        req.thinking.as_ref(),
-        &state.default_effort,
-        upstream_model.as_ref(),
-    );
     let session_id = header_str(&headers, "x-claude-code-session-id");
-    let upstream_req = translate::anthropic_to_responses(&req, &resolved.slug, &effort, session_id);
-    // Diagnostic chain (redacted: ids and effort levels only, never prompts,
-    // tokens or credentials): selected id -> backend slug -> effort the client
-    // sent (with its source) -> effort forwarded upstream. The raw client
-    // string is sanitized: only declared effort levels are printable, so a
-    // hostile output_config can never forge or flood the log.
-    let effort_source = if request_effort.is_some() {
-        "request"
-    } else if resolved.effort.is_some() {
-        "id_suffix"
-    } else if req
-        .thinking
-        .as_ref()
-        .map(|t| t.kind == "enabled" && t.budget_tokens.is_some())
-        .unwrap_or(false)
-    {
-        "thinking"
-    } else {
-        "default"
-    };
-    let effort_received = request_effort.or(resolved.effort.as_deref()).unwrap_or("-");
-    let printable = if effort_received == "-" || translate::is_known_effort(effort_received) {
-        effort_received
-    } else {
-        "<invalid>"
-    };
-    tracing::info!(
-        selected_model = %req.model,
-        backend_slug = %resolved.slug,
-        effort_received = %format!("{effort_source}:{printable}"),
-        effort_sent = %effort,
-        "model resolution"
-    );
-    tracing::debug!(
-        model = %resolved.slug,
-        %effort,
-        stream = req.stream,
-        tools = req.tools.len(),
-        input_items = upstream_req.input.len(),
-        "forwarding to codex"
-    );
-
+    // Attempt 1 is always the model the client selected — the chain (if
+    // enabled) only ever runs AFTER this fails with a transient error.
+    let upstream_req = build_attempt(
+        &state,
+        &req,
+        request_effort,
+        session_id,
+        &resolved.slug,
+        resolved.effort.as_deref(),
+    )
+    .await;
     let stream = match state.upstream.responses(&upstream_req).await {
         Ok(s) => s,
-        Err(e) => return upstream_error_response(e),
+        Err(e) => {
+            match run_chain(&state, &req, request_effort, session_id, &resolved.slug, e).await {
+                ChainOutcome::Stream(s) => s,
+                ChainOutcome::Terminal(resp) => return resp,
+            }
+        }
     };
     let mut extra_headers = Vec::new();
     for (name, value) in &stream.headers {

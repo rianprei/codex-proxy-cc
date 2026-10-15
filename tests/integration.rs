@@ -912,3 +912,310 @@ async fn concurrent_sessions_are_isolated() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Opt-in same-provider chain fallback (CLAUDE_CODEX_CHAIN)
+// ---------------------------------------------------------------------------
+
+/// Model slugs of every recorded /responses call, in order — the exact
+/// attempt sequence the proxy made against the upstream.
+fn sent_models(mock: &MockUpstream) -> Vec<String> {
+    mock.recorded
+        .bodies
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|b| {
+            serde_json::from_str::<serde_json::Value>(b)
+                .ok()
+                .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_string))
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+/// Compat guarantee: with NO chain configured (env unset), a persistent 5xx
+/// on the selected model surfaces the error exactly as before the feature
+/// existed — the bounded retries of the one logical attempt, and nothing
+/// else. This is the test that pins "empty chain = byte-identical".
+#[tokio::test]
+async fn no_chain_env_behavior_unchanged() {
+    let (addr, mock, _h) = MockUpstream::new(&good_sse())
+        .with_transient_failures(50, StatusCode::BAD_GATEWAY, "0")
+        .spawn()
+        .await;
+    // No chain in state == CLAUDE_CODEX_CHAIN unset at startup.
+    let state = mock.state(addr, "nochain", None).await;
+
+    let (status, raw) = post_messages(&state, None, simple_request()).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "body was {raw}");
+    assert_eq!(
+        mock.responses_calls(),
+        3,
+        "exactly the 3 bounded-retry calls of the single attempt — no chain walk"
+    );
+}
+
+/// Happy path of the chain: the selected model fails with a persistent 5xx
+/// and the next chain candidate serves the request. The upstream must see a
+/// request carrying the CANDIDATE slug and the client must get a 200.
+#[tokio::test]
+async fn chain_falls_on_5xx_to_next_model() {
+    let (addr, mock, _h) = MockUpstream::new(&good_sse())
+        .with_model_failures("gpt-6-astra", StatusCode::BAD_GATEWAY)
+        .spawn()
+        .await;
+    let state = mock
+        .state_with_chain(
+            addr,
+            "chain5xx",
+            None,
+            vec!["gpt-6-astra".into(), "gpt-5.6-sol".into()],
+        )
+        .await;
+
+    let (status, raw) = post_messages(&state, None, simple_request()).await;
+    assert_eq!(status, StatusCode::OK, "body was {raw}");
+    // 3 bounded-retry calls for the selected model + 1 for the candidate.
+    assert_eq!(mock.responses_calls(), 4);
+    assert_eq!(
+        sent_models(&mock),
+        vec!["gpt-6-astra", "gpt-6-astra", "gpt-6-astra", "gpt-5.6-sol",],
+        "the chain must fall from the selected slug to the next candidate"
+    );
+}
+
+/// Quota exhaustion on the SELECTED model must never chain: the account is
+/// out and every model would fail identically, so the terminal quota error
+/// (retry-after > 60) surfaces immediately with exactly ONE upstream call.
+#[tokio::test]
+async fn quota_exhaustion_never_chains() {
+    let (addr, mock, _h) = MockUpstream::new(&good_sse())
+        .with_transient_failures(50, StatusCode::TOO_MANY_REQUESTS, "5")
+        .spawn()
+        .await;
+    *mock.quota_body.lock().await =
+        Some(r#"{"error":{"message":"The usage limit has been reached"}}"#.to_string());
+    let state = mock
+        .state_with_chain(
+            addr,
+            "quota-chain",
+            None,
+            vec!["gpt-5.6-sol".into(), "gpt-5.6-terra".into()],
+        )
+        .await;
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .body(Body::from(simple_request().to_string()))
+        .unwrap();
+    let resp = claudecodex::server::router(state.clone())
+        .oneshot(req)
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    let ra = resp
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .expect("quota 429 must send retry-after");
+    assert!(ra > 60, "retry-after must be terminal (>60s), got {ra}");
+    assert_eq!(
+        mock.responses_calls(),
+        1,
+        "quota exhaustion must surface at once — no retry, no chain walk"
+    );
+}
+
+/// Chain exhaustion: every candidate fails with 5xx, the client gets the
+/// LAST upstream error through the existing error mapping, and nothing
+/// loops. Each failing logical attempt costs 3 upstream calls (the bounded
+/// retry layer inside upstream.responses), so a chain of 2 slugs is 6.
+#[tokio::test]
+async fn chain_exhausts_surfaces_last_error() {
+    let (addr, mock, _h) = MockUpstream::new(&good_sse())
+        .with_transient_failures(50, StatusCode::BAD_GATEWAY, "0")
+        .spawn()
+        .await;
+    let state = mock
+        .state_with_chain(
+            addr,
+            "chain-exhaust",
+            None,
+            vec!["gpt-6-astra".into(), "gpt-5.6-sol".into()],
+        )
+        .await;
+
+    let (status, raw) = post_messages(&state, None, simple_request()).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "body was {raw}");
+    let v: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+    assert_eq!(v["error"]["type"], "api_error");
+    // 2 logical attempts (selected + candidate) x 3 bounded-retry calls.
+    assert_eq!(mock.responses_calls(), 6);
+    assert_eq!(
+        sent_models(&mock),
+        vec![
+            "gpt-6-astra",
+            "gpt-6-astra",
+            "gpt-6-astra",
+            "gpt-5.6-sol",
+            "gpt-5.6-sol",
+            "gpt-5.6-sol",
+        ],
+        "the selected model and every candidate must be attempted once each"
+    );
+}
+
+/// Circuit breaker: a candidate that failed with 429/5xx is skipped for the
+/// cooldown window — a second request within 60s goes straight to the NEXT
+/// candidate without paying for the known-bad one. The SELECTED model is
+/// never keyed into the cooldown map.
+#[tokio::test]
+async fn chain_cooldown_skips_candidate() {
+    // astra fails persistently via the per-model directive; gpt-5.6-sol
+    // fails exactly one logical attempt (3 bounded-retry calls from the
+    // transient budget) and enters cooldown; gpt-5.6-terra always succeeds.
+    let (addr, mock, _h) = MockUpstream::new(&good_sse())
+        .with_model_failures("gpt-6-astra", StatusCode::BAD_GATEWAY)
+        .with_transient_failures(3, StatusCode::BAD_GATEWAY, "0")
+        .spawn()
+        .await;
+    // astra is NOT in the chain: the chain must still apply, in order,
+    // from the top.
+    let state = mock
+        .state_with_chain(
+            addr,
+            "chain-cooldown",
+            None,
+            vec!["gpt-5.6-sol".into(), "gpt-5.6-terra".into()],
+        )
+        .await;
+    let mut req = simple_request();
+    req["model"] = serde_json::json!("claude-gpt-6-astra");
+
+    // Request 1: astra fails (directive), sol fails (budget) — its cooldown
+    // opens — and terra serves the request.
+    let (status, raw) = post_messages(&state, None, req.clone()).await;
+    assert_eq!(status, StatusCode::OK, "body was {raw}");
+    assert_eq!(
+        sent_models(&mock),
+        vec![
+            "gpt-6-astra",
+            "gpt-6-astra",
+            "gpt-6-astra",
+            "gpt-5.6-sol",
+            "gpt-5.6-sol",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+        ],
+        "request 1: selected fails, first candidate fails, second serves"
+    );
+    {
+        let cooldowns = state.chain_cooldowns.lock().unwrap();
+        let until = cooldowns
+            .get("gpt-5.6-sol")
+            .expect("the failed candidate must be in cooldown");
+        assert!(
+            *until > std::time::Instant::now(),
+            "cooldown must still be open"
+        );
+        assert!(
+            !cooldowns.contains_key("gpt-6-astra"),
+            "the selected model must never enter cooldown"
+        );
+    }
+
+    // Request 2 (inside the window): sol is skipped directly — astra then
+    // terra; no sol request ever reaches the upstream.
+    let (status, raw) = post_messages(&state, None, req).await;
+    assert_eq!(status, StatusCode::OK, "body was {raw}");
+    assert_eq!(
+        sent_models(&mock)[7..],
+        vec!["gpt-6-astra", "gpt-6-astra", "gpt-6-astra", "gpt-5.6-terra",],
+        "request 2 must skip the cooldown candidate without an upstream call"
+    );
+}
+
+/// Quota exhaustion on a CANDIDATE stops the walk mid-chain: the account is
+/// out, so no further candidate is tried and the terminal quota error
+/// (retry-after > 60) surfaces instead of the earlier 5xx.
+#[tokio::test]
+async fn chain_quota_on_candidate_stops_walk() {
+    // astra fails with a steady 502 (the chain trigger); gpt-5.6-sol is
+    // armed with the quota 429 body; terra must never be attempted.
+    let (addr, mock, _h) = MockUpstream::new(&good_sse())
+        .with_status(StatusCode::BAD_GATEWAY)
+        .with_model_failures("gpt-5.6-sol", StatusCode::TOO_MANY_REQUESTS)
+        .spawn()
+        .await;
+    *mock.quota_body.lock().await =
+        Some(r#"{"error":{"message":"The usage limit has been reached"}}"#.to_string());
+    let state = mock
+        .state_with_chain(
+            addr,
+            "chain-quota",
+            None,
+            vec![
+                "gpt-6-astra".into(),
+                "gpt-5.6-sol".into(),
+                "gpt-5.6-terra".into(),
+            ],
+        )
+        .await;
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .body(Body::from(simple_request().to_string()))
+        .unwrap();
+    let resp = claudecodex::server::router(state.clone())
+        .oneshot(req)
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    let ra = resp
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .expect("candidate quota must surface a terminal retry-after");
+    assert!(ra > 60, "retry-after must be terminal (>60s), got {ra}");
+    assert_eq!(
+        sent_models(&mock),
+        vec!["gpt-6-astra", "gpt-6-astra", "gpt-6-astra", "gpt-5.6-sol",],
+        "the walk must stop at the quota-failing candidate"
+    );
+}
+
+/// A chain entry that does not resolve in the catalog (operator typo in
+/// CLAUDE_CODEX_CHAIN) is skipped loudly — never an error, never a silent
+/// upstream call — and the next usable candidate serves the request.
+#[tokio::test]
+async fn chain_skips_unknown_candidate_slug() {
+    let (addr, mock, _h) = MockUpstream::new(&good_sse())
+        .with_model_failures("gpt-6-astra", StatusCode::BAD_GATEWAY)
+        .spawn()
+        .await;
+    let state = mock
+        .state_with_chain(
+            addr,
+            "chain-unknown",
+            None,
+            vec!["gpt-nonexistent".into(), "gpt-5.6-sol".into()],
+        )
+        .await;
+
+    let (status, raw) = post_messages(&state, None, simple_request()).await;
+    assert_eq!(status, StatusCode::OK, "body was {raw}");
+    assert_eq!(
+        sent_models(&mock),
+        vec!["gpt-6-astra", "gpt-6-astra", "gpt-6-astra", "gpt-5.6-sol",],
+        "the unknown slug must be skipped without an upstream call"
+    );
+}

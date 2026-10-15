@@ -54,3 +54,35 @@ Effort precedence: the request's `output_config.effort` (the native Claude Code
 effort control), then the `:<effort>` id suffix, then the request's
 `thinking.budget_tokens`, then `--default-reasoning-effort`, clamped to what
 the model advertises.
+
+## Opt-in fallback chain (same provider only)
+
+`CLAUDE_CODEX_CHAIN` is a comma-separated list of Codex slugs in preference
+order:
+
+```sh
+CLAUDE_CODEX_CHAIN="gpt-6-astra,gpt-5.6-sol,gpt-5.6-terra" \
+  cargo run --release -- --auth-token secret
+```
+
+When the selected model fails with a transient upstream error (429/5xx), the
+proxy retries the request with the next chain entry after it — same Codex
+backend, same ChatGPT account, never a paid API or another provider.
+
+- **Quota exhaustion never chains.** "usage limit" is an account-level terminal
+  state: every model would fail identically, so the terminal error surfaces
+  immediately with `retry-after: 3600`, on any attempt.
+- **Circuit breaker.** A candidate that failed with 429/5xx is skipped for
+  60s (per-slug cooldown). The selected model is never keyed — it is always
+  attempted first.
+- **Loud, never silent.** Every switch logs a `warn` naming the original
+  slug, the failing status, the new slug and the remaining candidates;
+  exhaustion is logged too, and the per-attempt "model resolution" line shows
+  the slug actually used.
+- **Effort is re-resolved per candidate**, from the request-level channels
+  (`output_config.effort`, `thinking`) or the CLI default, clamped to what
+  the candidate declares — the selected model's `:effort` suffix does not
+  carry over.
+- **Off by default.** Unset or empty = the feature is fully disabled and
+  behavior is identical to a no-chain build. A chain entry that does not
+  resolve in the catalog is skipped with a warning.
