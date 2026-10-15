@@ -2,6 +2,44 @@ use claudecodex::{server, upstream, BoxResult};
 
 use std::path::PathBuf;
 
+/// Minimal stderr logger (replaces env_logger + its transitive tree).
+/// Reads RUST_LOG (same level names: error/warn/info/debug/trace);
+/// unset means the default_filter. No colors, no target filtering —
+/// journalctl already adds timestamps.
+struct StderrLogger {
+    level: log::LevelFilter,
+}
+
+impl log::Log for StderrLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= self.level
+    }
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            eprintln!("[{}] {}", record.level(), record.args());
+        }
+    }
+    fn flush(&self) {}
+}
+
+fn init_logger(default_filter: &str) {
+    let raw = std::env::var("RUST_LOG").unwrap_or_else(|_| default_filter.to_string());
+    // Accepts "debug", "claudecodex=debug,info" etc. — takes the loosest level.
+    let level = raw
+        .rsplit([',', '='])
+        .find_map(|s| match s.trim() {
+            "error" => Some(log::LevelFilter::Error),
+            "warn" => Some(log::LevelFilter::Warn),
+            "info" => Some(log::LevelFilter::Info),
+            "debug" => Some(log::LevelFilter::Debug),
+            "trace" => Some(log::LevelFilter::Trace),
+            _ => None,
+        })
+        .unwrap_or(log::LevelFilter::Info);
+    let _ = log::set_boxed_logger(Box::new(StderrLogger { level }));
+    log::set_max_level(level);
+}
+
 /// CLI arguments parsed manually (no clap): 7 flags, all optional.
 struct Cli {
     port: u16,
@@ -111,10 +149,7 @@ async fn main() -> BoxResult<()> {
     } else {
         "info"
     };
-    env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or(default_filter),
-    )
-    .init();
+    init_logger(default_filter);
 
     let codex_home = cli.codex_home.unwrap_or_else(|| home_dir().join(".codex"));
     let chain = chain_from_env();

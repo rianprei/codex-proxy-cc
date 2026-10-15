@@ -11,7 +11,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use futures_util::StreamExt;
+use tokio_stream::StreamExt as _;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -658,7 +658,7 @@ async fn messages(
 }
 
 type UpstreamBody =
-    std::pin::Pin<Box<dyn futures_util::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>>;
+    std::pin::Pin<Box<dyn futures_core::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>>;
 
 /// Drives the upstream SSE body through the translator, writing Anthropic SSE frames to `tx`
 /// and interleaving `ping` frames while the upstream is silent.
