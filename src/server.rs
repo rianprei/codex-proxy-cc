@@ -21,7 +21,11 @@ use crate::translate::{self, ResponsesToAnthropic, SseParser};
 use crate::upstream::{Upstream, UpstreamError};
 
 /// Interval between SSE `ping` frames while the upstream is quiet.
-const PING_INTERVAL: Duration = Duration::from_secs(15);
+/// Interval between SSE `ping` frames while the upstream is quiet.
+/// 5s (ported from claude-nim): shorter pings sit further inside Claude
+/// Code's streaming idle watchdog, so long silent reasoning phases never
+/// trip it on slow upstreams.
+const PING_INTERVAL: Duration = Duration::from_secs(5);
 /// Give up on an upstream stream that has sent nothing for this long.
 const MAX_STREAM_IDLE: Duration = Duration::from_secs(600);
 
