@@ -240,7 +240,18 @@ async fn mock_responses(
     // the recorded log below. Only requests whose body mentions the armed
     // slug fail; everything else flows to the normal paths.
     let fail_model = m.fail_model.lock().unwrap().clone();
-    let model_failure = fail_model.is_some_and(|s| body.contains(s.as_str()));
+    // Match the parsed `model` field, never a substring: a prompt that
+    // merely mentions the armed slug must not trip the failure directive.
+    let model_failure = fail_model.is_some_and(|s| {
+        serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| {
+                v.get("model")
+                    .and_then(|mo| mo.as_str())
+                    .map(str::to_string)
+            })
+            .is_some_and(|model| model == s)
+    });
     m.recorded.bodies.lock().unwrap().push(body);
     if let Some(a) = headers.get("authorization") {
         m.recorded

@@ -86,3 +86,5 @@ backend, same ChatGPT account, never a paid API or another provider.
 - **Off by default.** Unset or empty = the feature is fully disabled and
   behavior is identical to a no-chain build. A chain entry that does not
   resolve in the catalog is skipped with a warning.
+- **Lenient parsing, strict behavior.** Entries are trimmed; empty and
+  duplicate entries are dropped at startup (first occurrence wins).

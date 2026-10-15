@@ -983,6 +983,14 @@ async fn chain_falls_on_5xx_to_next_model() {
         vec!["gpt-6-astra", "gpt-6-astra", "gpt-6-astra", "gpt-5.6-sol",],
         "the chain must fall from the selected slug to the next candidate"
     );
+    // Contract pin: candidates re-resolve effort from request-level
+    // channels against THEIR catalog entry — the selected id's `:xhigh`
+    // suffix must NOT carry (sol declares low/medium/high only). The CLI
+    // default "medium" is sol-supported and is what goes upstream; a
+    // carried suffix would clamp to sol's first declared level, "low".
+    let last: serde_json::Value = serde_json::from_str(&mock.last_body()).unwrap();
+    assert_eq!(last["model"], "gpt-5.6-sol");
+    assert_eq!(last["reasoning"]["effort"], "medium");
 }
 
 /// Quota exhaustion on the SELECTED model must never chain: the account is

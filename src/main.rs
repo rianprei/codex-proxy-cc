@@ -40,14 +40,18 @@ fn home_dir() -> PathBuf {
 }
 
 /// Split a `CLAUDE_CODEX_CHAIN` value into Codex slugs, preserving order,
-/// trimming whitespace and dropping empty entries (so a trailing comma or a
-/// whitespace-only value cannot create phantom candidates).
+/// trimming whitespace, dropping empty entries (so a trailing comma or a
+/// whitespace-only value cannot create phantom candidates) and collapsing
+/// duplicates (a repeated entry would be re-attempted inside one walk and
+/// open a bogus cooldown for its twin).
 fn parse_chain(raw: &str) -> Vec<String> {
-    raw.split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect()
+    let mut out: Vec<String> = Vec::new();
+    for slug in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        if !out.iter().any(|x| x.as_str() == slug) {
+            out.push(slug.to_string());
+        }
+    }
+    out
 }
 
 /// The opt-in same-provider fallback chain: comma-separated Codex slugs in
@@ -136,5 +140,7 @@ mod tests {
         );
         // A trailing comma is a config typo, not a fourth candidate.
         assert_eq!(parse_chain("a,b,"), vec!["a", "b"]);
+        // Duplicates collapse to the first occurrence, order preserved.
+        assert_eq!(parse_chain("a, b ,a,a"), vec!["a", "b"]);
     }
 }

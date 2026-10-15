@@ -205,7 +205,10 @@ fn upstream_error_response(err: UpstreamError) -> Response {
 fn in_cooldown(cooldowns: &Mutex<HashMap<String, Instant>>, slug: &str) -> bool {
     cooldowns
         .lock()
-        .expect("chain cooldown map")
+        // Poison recovery is always safe here: the map only holds
+        // cooldown timestamps. A panicked peer must never wedge the
+        // proxy for every later request.
+        .unwrap_or_else(|p| p.into_inner())
         .get(slug)
         .is_some_and(|until| Instant::now() < *until)
 }
@@ -214,7 +217,10 @@ fn in_cooldown(cooldowns: &Mutex<HashMap<String, Instant>>, slug: &str) -> bool 
 fn set_cooldown(cooldowns: &Mutex<HashMap<String, Instant>>, slug: &str) {
     cooldowns
         .lock()
-        .expect("chain cooldown map")
+        // Poison recovery is always safe here: the map only holds
+        // cooldown timestamps. A panicked peer must never wedge the
+        // proxy for every later request.
+        .unwrap_or_else(|p| p.into_inner())
         .insert(slug.to_string(), Instant::now() + CHAIN_COOLDOWN);
 }
 
@@ -399,10 +405,13 @@ async fn run_chain(
                     UpstreamError::Status { status, .. }
                         if *status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
                 );
+                // Symmetric with the trigger guard above: quota is quota on
+                // any status that carries its body (429 in practice, 5xx
+                // defensively) — the walk must stop identically everywhere.
                 let quota = matches!(
                     &e,
                     UpstreamError::Status { status, body }
-                        if *status == StatusCode::TOO_MANY_REQUESTS
+                        if (*status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error())
                             && crate::upstream::is_quota_exhaustion(body)
                 );
                 if chain_failure {
