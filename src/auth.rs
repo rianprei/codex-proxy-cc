@@ -5,15 +5,16 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
-use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio::sync::Mutex;
 
+use crate::util;
+use crate::BoxResult;
+
 const REFRESH_URL: &str = "https://auth.openai.com/oauth/token";
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
-const REFRESH_AFTER_DAYS: i64 = 8;
+const REFRESH_AFTER_SECS: i64 = 8 * 86400;
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct Tokens {
@@ -70,28 +71,30 @@ pub struct AuthStore {
 }
 
 impl AuthStore {
-    pub async fn load(codex_home: &Path) -> Result<Self> {
+    pub async fn load(codex_home: &Path) -> BoxResult<Self> {
         let path = codex_home.join("auth.json");
         let raw = match tokio::fs::read(&path).await {
             Ok(raw) => raw,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                bail!("{} not found: run `codex login` first", path.display())
+                return Err(format!("{} not found: run `codex login` first", path.display()).into())
             }
-            Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+            Err(e) => return Err(format!("read {}: {e}", path.display()).into()),
         };
-        let file: AuthFile =
-            serde_json::from_slice(&raw).with_context(|| format!("parse {}", path.display()))?;
+        let file: AuthFile = serde_json::from_slice(&raw)
+            .map_err(|e| format!("parse {}: {e}", path.display()))?;
         if file.tokens.access_token.is_empty() || file.tokens.refresh_token.is_empty() {
-            bail!(
+            return Err(format!(
                 "{} has no ChatGPT tokens: run `codex login` first",
                 path.display()
-            );
+            )
+            .into());
         }
         if file.tokens.account_id.is_empty() {
-            bail!(
+            return Err(format!(
                 "{} has no account_id: run `codex login` again",
                 path.display()
-            );
+            )
+            .into());
         }
         // The credentials mutex is held across refresh calls, so a stalled
         // request to the auth server must not block the proxy indefinitely.
@@ -105,7 +108,7 @@ impl AuthStore {
             .no_deflate()
             .no_brotli()
             .build()
-            .context("build auth http client")?;
+            .map_err(|e| format!("build auth http client: {e}"))?;
         Ok(Self {
             path,
             http,
@@ -114,11 +117,11 @@ impl AuthStore {
     }
 
     /// Current credentials, refreshing first when `last_refresh` is older than 8 days.
-    pub async fn credentials(&self) -> Result<Credentials> {
+    pub async fn credentials(&self) -> BoxResult<Credentials> {
         let mut file = self.inner.lock().await;
-        if is_stale(file.last_refresh.as_deref(), Utc::now()) {
+        if is_stale(file.last_refresh.as_deref()) {
             if let Err(e) = self.refresh_locked(&mut file).await {
-                tracing::warn!(error = %e, "proactive token refresh failed; using existing token");
+                log::warn!("proactive token refresh failed; using existing token: {e}");
             }
         }
         Ok(credentials_of(&file))
@@ -127,7 +130,7 @@ impl AuthStore {
     /// Refresh after an upstream 401. `rejected` is the access token that was rejected; if
     /// another request already refreshed past it, the newer token is returned without a
     /// second refresh.
-    pub async fn refresh_after_401(&self, rejected: &str) -> Result<Credentials> {
+    pub async fn refresh_after_401(&self, rejected: &str) -> BoxResult<Credentials> {
         let mut file = self.inner.lock().await;
         if file.tokens.access_token != rejected {
             return Ok(credentials_of(&file));
@@ -136,7 +139,7 @@ impl AuthStore {
         Ok(credentials_of(&file))
     }
 
-    async fn refresh_locked(&self, file: &mut AuthFile) -> Result<()> {
+    async fn refresh_locked(&self, file: &mut AuthFile) -> BoxResult<()> {
         let body = RefreshRequest {
             client_id: CLIENT_ID,
             grant_type: "refresh_token",
@@ -148,14 +151,17 @@ impl AuthStore {
             .json(&body)
             .send()
             .await
-            .context("token refresh request")?;
+            .map_err(|e| format!("token refresh request: {e}"))?;
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
             let snippet: String = text.chars().take(300).collect();
-            bail!("token refresh failed with HTTP {status}: {snippet}");
+            return Err(format!("token refresh failed with HTTP {status}: {snippet}").into());
         }
-        let parsed: RefreshResponse = resp.json().await.context("parse refresh response")?;
+        let parsed: RefreshResponse = resp
+            .json()
+            .await
+            .map_err(|e| format!("parse refresh response: {e}"))?;
         if let Some(t) = parsed.access_token {
             file.tokens.access_token = t;
         }
@@ -165,9 +171,9 @@ impl AuthStore {
         if let Some(t) = parsed.id_token {
             file.tokens.id_token = t;
         }
-        file.last_refresh = Some(Utc::now().to_rfc3339_opts(SecondsFormat::Micros, true));
+        file.last_refresh = Some(util::rfc3339_now_micros());
         write_atomic(&self.path, file).await?;
-        tracing::info!("refreshed ChatGPT access token");
+        log::info!("refreshed ChatGPT access token");
         Ok(())
     }
 }
@@ -179,44 +185,57 @@ fn credentials_of(file: &AuthFile) -> Credentials {
     }
 }
 
-fn is_stale(last_refresh: Option<&str>, now: DateTime<Utc>) -> bool {
-    match last_refresh.and_then(|s| DateTime::parse_from_rfc3339(s).ok()) {
-        Some(t) => now - t.with_timezone(&Utc) > TimeDelta::days(REFRESH_AFTER_DAYS),
+fn is_stale(last_refresh: Option<&str>) -> bool {
+    match last_refresh.and_then(util::parse_rfc3339) {
+        Some(t) => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            now - t > REFRESH_AFTER_SECS
+        }
         // Unknown age: do not hammer the refresh endpoint; a 401 forces a refresh anyway.
         None => false,
     }
 }
 
-async fn write_atomic(path: &Path, file: &AuthFile) -> Result<()> {
+async fn write_atomic(path: &Path, file: &AuthFile) -> BoxResult<()> {
     let data = serde_json::to_vec_pretty(file)?;
     let tmp = path.with_extension("json.tmp");
     tokio::fs::write(&tmp, &data)
         .await
-        .with_context(|| format!("write {}", tmp.display()))?;
+        .map_err(|e| format!("write {}: {e}", tmp.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).await?;
+        tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+            .await
+            .map_err(|e| format!("chmod {}: {e}", tmp.display()))?;
     }
     tokio::fs::rename(&tmp, path)
         .await
-        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
+        .map_err(|e| format!("rename {} -> {}: {e}", tmp.display(), path.display()))?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::rfc3339_from_unix;
 
     #[test]
     fn staleness_uses_eight_day_window() {
-        let now = DateTime::parse_from_rfc3339("2026-09-10T00:00:00Z")
-            .expect("valid")
-            .with_timezone(&Utc);
-        assert!(!is_stale(Some("2026-09-05T00:00:00Z"), now));
-        assert!(is_stale(Some("2026-08-01T00:00:00.123456Z"), now));
-        assert!(!is_stale(None, now));
-        assert!(!is_stale(Some("garbage"), now));
+        // Dates relative to NOW: 5 days ago is fresh, 40 days ago is stale.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let five_days_ago = rfc3339_from_unix(now - 5 * 86400);
+        let forty_days_ago = rfc3339_from_unix(now - 40 * 86400);
+        assert!(!is_stale(Some(&five_days_ago)));
+        assert!(is_stale(Some(&forty_days_ago)));
+        assert!(!is_stale(None));
+        assert!(!is_stale(Some("garbage")));
     }
 
     #[test]

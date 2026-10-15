@@ -3,7 +3,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
 use bytes::Bytes;
 use futures_util::Stream;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
@@ -12,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::auth::{AuthStore, Credentials};
+use crate::util;
+use crate::BoxResult;
 
 pub const DEFAULT_BASE: &str = "https://chatgpt.com/backend-api/codex";
 const CLIENT_VERSION: &str = "0.153.4";
@@ -29,7 +30,21 @@ pub enum UpstreamError {
     #[error("upstream returned HTTP {status}: {body}")]
     Status { status: StatusCode, body: String },
     #[error("{0}")]
-    Other(#[from] anyhow::Error),
+    Other(#[from] Box<dyn std::error::Error + Send + Sync>),
+    #[error("{0}")]
+    Msg(String),
+}
+
+impl From<String> for UpstreamError {
+    fn from(s: String) -> Self {
+        UpstreamError::Msg(s)
+    }
+}
+
+impl From<&str> for UpstreamError {
+    fn from(s: &str) -> Self {
+        UpstreamError::Msg(s.to_string())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -133,7 +148,7 @@ pub fn retry_after_delay_for_test(headers: &HeaderMap, cap: Duration) -> Duratio
 }
 
 impl Upstream {
-    pub fn new(base: String, auth: Arc<AuthStore>) -> Result<Self> {
+    pub fn new(base: String, auth: Arc<AuthStore>) -> BoxResult<Self> {
         let http = reqwest::Client::builder()
             // Conexão rápida: loopback-local para o upstream, falha logo se
             // não houver caminho de rede.
@@ -154,24 +169,25 @@ impl Upstream {
             .no_deflate()
             .no_brotli()
             .build()
-            .context("build http client")?;
+            .map_err(|e| format!("build http client: {e}"))?;
         Ok(Self {
             base: base.trim_end_matches('/').to_string(),
             http,
             auth,
-            session_id: uuid::Uuid::new_v4().to_string(),
+            session_id: util::unique_id(),
         })
     }
 
-    fn headers(&self, creds: &Credentials) -> Result<HeaderMap> {
+    fn headers(&self, creds: &Credentials) -> BoxResult<HeaderMap> {
         let mut h = HeaderMap::new();
         let mut bearer = HeaderValue::from_str(&format!("Bearer {}", creds.access_token))
-            .context("access token is not a valid header value")?;
+            .map_err(|e| format!("access token is not a valid header value: {e}"))?;
         bearer.set_sensitive(true);
         h.insert(AUTHORIZATION, bearer);
         h.insert(
             "chatgpt-account-id",
-            HeaderValue::from_str(&creds.account_id).context("account id header")?,
+            HeaderValue::from_str(&creds.account_id)
+                .map_err(|e| format!("account id header: {e}"))?,
         );
         h.insert("originator", HeaderValue::from_static(ORIGINATOR));
         h.insert(
@@ -185,7 +201,8 @@ impl Upstream {
         h.insert("version", HeaderValue::from_static(CLIENT_VERSION));
         h.insert(
             "session-id",
-            HeaderValue::from_str(&self.session_id).context("session id header")?,
+            HeaderValue::from_str(&self.session_id)
+                .map_err(|e| format!("session id header: {e}"))?,
         );
         h.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         Ok(h)
@@ -206,7 +223,7 @@ impl Upstream {
                 .timeout(timeout)
                 .send()
                 .await
-                .context("GET /models")?;
+                .map_err(|e| format!("GET /models: {e}"))?;
             let status = resp.status();
             if status == StatusCode::UNAUTHORIZED && attempt == 0 {
                 creds = self.auth.refresh_after_401(&creds.access_token).await?;
@@ -216,10 +233,11 @@ impl Upstream {
                 let body = resp.text().await.unwrap_or_default();
                 return Err(UpstreamError::Status { status, body });
             }
-            let parsed: ModelsResponse = resp.json().await.context("parse /models")?;
+            let parsed: ModelsResponse =
+                resp.json().await.map_err(|e| format!("parse /models: {e}"))?;
             return Ok(parsed.models);
         }
-        Err(anyhow::anyhow!("unreachable: /models retry loop exhausted").into())
+        Err("unreachable: /models retry loop exhausted".into())
     }
 
     /// Start a streaming `/responses` call. Non-2xx statuses are returned as errors with the
@@ -249,8 +267,8 @@ impl Upstream {
             headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
             headers.insert(
                 "x-client-request-id",
-                HeaderValue::from_str(&uuid::Uuid::new_v4().to_string())
-                    .context("request id header")?,
+                HeaderValue::from_str(&util::unique_id())
+                    .map_err(|e| format!("request id header: {e}"))?,
             );
             let resp = self
                 .http
@@ -263,11 +281,11 @@ impl Upstream {
                 .timeout(Duration::from_secs(600))
                 .send()
                 .await
-                .context("POST /responses")?;
+                .map_err(|e| format!("POST /responses: {e}"))?;
             let status = resp.status();
             if status == StatusCode::UNAUTHORIZED && auth_retries == 0 {
                 auth_retries += 1;
-                tracing::info!("upstream 401; refreshing token and retrying once");
+                log::info!("upstream 401; refreshing token and retrying once");
                 creds = self.auth.refresh_after_401(&creds.access_token).await?;
                 continue;
             }
@@ -280,17 +298,17 @@ impl Upstream {
                 let retry_after = retry_after_delay(resp.headers(), RETRY_AFTER_CAP);
                 let body_text = resp.text().await.unwrap_or_default();
                 if is_quota_exhaustion(&body_text) {
-                    tracing::warn!("upstream reports usage limit reached; not retrying");
+                    log::warn!("upstream reports usage limit reached; not retrying");
                     return Err(UpstreamError::Status {
                         status,
                         body: body_text,
                     });
                 }
                 rate_limit_retries += 1;
-                tracing::warn!(
-                    attempt = rate_limit_retries,
-                    delay_ms = retry_after.as_millis() as u64,
-                    "upstream rate-limited; retrying"
+                log::warn!(
+                    "upstream rate-limited; retrying attempt={} delay_ms={}",
+                    rate_limit_retries,
+                    retry_after.as_millis() as u64
                 );
                 tokio::time::sleep(retry_after).await;
                 continue;
@@ -298,10 +316,10 @@ impl Upstream {
             if status.is_server_error() && rate_limit_retries < MAX_UPSTREAM_RETRIES {
                 rate_limit_retries += 1;
                 let delay = retry_after_delay(resp.headers(), RETRY_AFTER_CAP);
-                tracing::warn!(
-                    attempt = rate_limit_retries,
-                    delay_ms = delay.as_millis() as u64,
-                    "upstream 5xx; retrying"
+                log::warn!(
+                    "upstream 5xx; retrying attempt={} delay_ms={}",
+                    rate_limit_retries,
+                    delay.as_millis() as u64
                 );
                 tokio::time::sleep(delay).await;
                 continue;
@@ -324,7 +342,7 @@ impl Upstream {
                 body: Box::pin(resp.bytes_stream()),
             });
         }
-        Err(anyhow::anyhow!(
+        Err(format!(
             "upstream retries exhausted after {} attempts",
             1 + 1 + MAX_UPSTREAM_RETRIES
         )

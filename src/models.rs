@@ -134,7 +134,7 @@ pub fn public_list(models: &[UpstreamModel], created_at: &str) -> Vec<PublicMode
     let warned = WARNED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
     for slug in MAIN_SLUGS {
         if !seen.contains(*slug) && warned.lock().unwrap().insert(slug) {
-            tracing::warn!(slug, "main model missing from upstream catalog");
+            log::warn!("main model missing from upstream catalog: {slug}");
         }
     }
     out
@@ -171,7 +171,7 @@ impl Catalog {
             cache: Arc::new(RwLock::new(None)),
             refresh: Arc::new(Mutex::new(())),
             last_failure: Arc::new(RwLock::new(None)),
-            started_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            started_at: crate::util::rfc3339_now(),
         }
     }
 
@@ -211,12 +211,12 @@ impl Catalog {
                 models
             }
             Ok(_) => {
-                tracing::warn!("upstream returned an empty model list");
+                log::warn!("upstream returned an empty model list");
                 *self.last_failure.write().await = Some(Instant::now());
                 self.stale().await
             }
             Err(e) => {
-                tracing::warn!(error = %e, "model list fetch failed; serving cached list");
+                log::warn!("model list fetch failed; serving cached list: {e}");
                 *self.last_failure.write().await = Some(Instant::now());
                 self.stale().await
             }

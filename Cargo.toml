@@ -6,24 +6,20 @@ description = "Anthropic Messages API proxy for Codex (ChatGPT login) models, fo
 license = "MIT"
 
 [dependencies]
-anyhow = "1"
 axum = "0.7"
 bytes = "1"
-chrono = { version = "0.4", features = ["serde"] }
-clap = { version = "4", features = ["derive", "env"] }
+env_logger = "0.11"
 futures-util = "0.3"
+log = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "http2"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync", "fs"] }
 tokio-stream = "0.1"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-uuid = { version = "1", features = ["v4"] }
 
 [profile.release]
-opt-level = "z"
+opt-level = 3
 lto = true
 codegen-units = 1
 panic = "abort"

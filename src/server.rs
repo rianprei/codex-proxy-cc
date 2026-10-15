@@ -96,12 +96,12 @@ async fn log_request(req: Request, next: Next) -> Response {
     let path = req.uri().path().to_string();
     let started = std::time::Instant::now();
     let res = next.run(req).await;
-    tracing::info!(
-        %method,
-        %path,
-        status = res.status().as_u16(),
-        ms = started.elapsed().as_millis() as u64,
-        "request"
+    log::info!(
+        "request method={} path={} status={} ms={}",
+        method,
+        path,
+        res.status().as_u16(),
+        started.elapsed().as_millis() as u64
     );
     res
 }
@@ -189,6 +189,7 @@ fn upstream_error_response(err: UpstreamError) -> Response {
             "api_error",
             format!("upstream: {e:#}"),
         ),
+        UpstreamError::Msg(m) => error_response(StatusCode::BAD_GATEWAY, "api_error", m),
     }
 }
 
@@ -231,6 +232,7 @@ fn failure_brief(err: &UpstreamError) -> String {
     match err {
         UpstreamError::Status { status, .. } => status.as_u16().to_string(),
         UpstreamError::Other(e) => format!("transport: {e}"),
+        UpstreamError::Msg(m) => format!("transport: {m}"),
     }
 }
 
@@ -286,20 +288,21 @@ async fn build_attempt(
     } else {
         "<invalid>"
     };
-    tracing::info!(
-        selected_model = %req.model,
-        backend_slug = %slug,
-        effort_received = %format!("{effort_source}:{printable}"),
-        effort_sent = %effort,
-        "model resolution"
+    log::info!(
+        "model resolution selected_model={} backend_slug={} effort_received={}:{} effort_sent={}",
+        req.model,
+        slug,
+        effort_source,
+        printable,
+        effort
     );
-    tracing::debug!(
-        model = %slug,
-        %effort,
-        stream = req.stream,
-        tools = req.tools.len(),
-        input_items = upstream_req.input.len(),
-        "forwarding to codex"
+    log::debug!(
+        "forwarding to codex model={} effort={} stream={} tools={} input_items={}",
+        slug,
+        effort,
+        req.stream,
+        req.tools.len(),
+        upstream_req.input.len()
     );
     upstream_req
 }
@@ -367,7 +370,7 @@ async fn run_chain(
         // Circuit breaker: skip a candidate that failed inside the window —
         // it would fail the same way again.
         if in_cooldown(&state.chain_cooldowns, slug) {
-            tracing::warn!(slug, "chain candidate in cooldown; skipping");
+            log::warn!("chain candidate in cooldown; skipping: {slug}");
             continue;
         }
         // Validity: the candidate must exist in the catalog (same upstream,
@@ -379,7 +382,7 @@ async fn run_chain(
             .await
             .is_none()
         {
-            tracing::warn!(slug, "chain candidate not in catalog; skipping");
+            log::warn!("chain candidate not in catalog; skipping: {slug}");
             continue;
         }
         // LOUD switch record: what was asked, what failed and how, what we
@@ -389,12 +392,12 @@ async fn run_chain(
         } else {
             "-".to_string()
         };
-        tracing::warn!(
-            original_slug = %selected_slug,
-            failing_status = %failure_brief(&last_err),
-            new_slug = %slug,
-            remaining_candidates = %remaining,
-            "chain fallback: switching model"
+        log::warn!(
+            "chain fallback: switching model original_slug={} failing_status={} new_slug={} remaining_candidates={}",
+            selected_slug,
+            failure_brief(&last_err),
+            slug,
+            remaining
         );
         let upstream_req = build_attempt(state, req, request_effort, session_id, slug, None).await;
         match state.upstream.responses(&upstream_req).await {
@@ -427,10 +430,10 @@ async fn run_chain(
             }
         }
     }
-    tracing::warn!(
-        original_slug = %selected_slug,
-        chain = %state.chain.join(","),
-        "chain exhausted; surfacing last upstream error"
+    log::warn!(
+        "chain exhausted; surfacing last upstream error original_slug={} chain={}",
+        selected_slug,
+        state.chain.join(",")
     );
     ChainOutcome::Terminal(upstream_error_response(last_err))
 }
@@ -669,7 +672,7 @@ async fn pump_stream(mut body: UpstreamBody, model: String, tx: mpsc::Sender<Str
         match next {
             Err(_elapsed) => {
                 if last_activity.elapsed() >= MAX_STREAM_IDLE {
-                    tracing::warn!("upstream stream idle for {MAX_STREAM_IDLE:?}; aborting");
+                    log::warn!("upstream stream idle for {MAX_STREAM_IDLE:?}; aborting");
                     let ev = StreamEvent::Error {
                         error: ApiError {
                             kind: "api_error".into(),
@@ -687,7 +690,7 @@ async fn pump_stream(mut body: UpstreamBody, model: String, tx: mpsc::Sender<Str
                 last_activity = Instant::now();
                 for frame in parser.push(&chunk) {
                     let Ok(value) = serde_json::from_str::<Value>(&frame.data) else {
-                        tracing::debug!(event = ?frame.event, "non-json sse frame ignored");
+                        log::debug!("non-json sse frame ignored: {:?}", frame.event);
                         continue;
                     };
                     for ev in translator.handle(&value) {
@@ -701,7 +704,7 @@ async fn pump_stream(mut body: UpstreamBody, model: String, tx: mpsc::Sender<Str
                 }
             }
             Ok(Some(Err(e))) => {
-                tracing::warn!(error = %e, "upstream stream error");
+                log::warn!("upstream stream error: {e}");
                 let ev = StreamEvent::Error {
                     error: ApiError {
                         kind: "api_error".into(),
@@ -737,7 +740,7 @@ async fn collect_events(mut body: UpstreamBody, model: &str) -> (Vec<StreamEvent
             Ok(next) => next,
             Err(_elapsed) => {
                 if last_activity.elapsed() >= MAX_STREAM_IDLE {
-                    tracing::warn!("non-streaming upstream idle for {MAX_STREAM_IDLE:?}; aborting");
+                    log::warn!("non-streaming upstream idle for {MAX_STREAM_IDLE:?}; aborting");
                     idle_aborted = true;
                     break;
                 }

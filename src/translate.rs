@@ -289,7 +289,7 @@ pub fn build_input(req: &MessagesRequest) -> Vec<Value> {
                                 // thinking block cannot replay to Codex — but
                                 // dropping it silently contradicts the
                                 // fail-loudly contract, so log it (no content).
-                                tracing::warn!("dropping thinking block with non-codex signature");
+                                log::warn!("dropping thinking block with non-codex signature");
                                 continue;
                             };
                             b.flush();
@@ -332,7 +332,7 @@ pub fn build_tools(req: &MessagesRequest) -> Vec<Value> {
                         .filter(|c| c.is_ascii_graphic())
                         .take(64)
                         .collect();
-                    tracing::warn!(tool = %safe_name, "skipping unsupported server tool");
+                    log::warn!("skipping unsupported server tool: {safe_name}");
                     return None;
                 }
             }
@@ -529,7 +529,7 @@ impl ResponsesToAnthropic {
     pub fn new(model: &str) -> Self {
         Self {
             model: model.to_string(),
-            msg_id: format!("msg_{}", uuid::Uuid::new_v4().simple()),
+            msg_id: format!("msg_{}", crate::util::unique_id()),
             started: false,
             finished: false,
             next_index: 0,

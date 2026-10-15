@@ -25,13 +25,7 @@ pub fn write_fake_codex_home(tag: &str) -> PathBuf {
     // Cycle-3 #6: last_refresh must be FRESH — a stale date made every
     // credentials() call attempt a REAL refresh POST to auth.openai.com
     // (the "hermetic" suite relied on that network call failing).
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let fresh = chrono::DateTime::from_timestamp(secs as i64, 0)
-        .unwrap()
-        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let fresh = claudecodex::util::rfc3339_now();
     let auth = serde_json::json!({
         "auth_mode": "chatgpt",
         "tokens": {

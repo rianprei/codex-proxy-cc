@@ -188,7 +188,7 @@ pub struct MessageResponse {
 impl MessageResponse {
     pub fn new(model: String) -> Self {
         Self {
-            id: format!("msg_{}", uuid::Uuid::new_v4().simple()),
+            id: format!("msg_{}", crate::util::unique_id()),
             kind: "message",
             role: "assistant",
             model,

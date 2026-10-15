@@ -10,17 +10,20 @@ pub mod models;
 pub mod server;
 pub mod translate;
 pub mod upstream;
+pub mod util;
 
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use anyhow::Result;
-
 use crate::auth::AuthStore;
 use crate::models::Catalog;
 use crate::server::AppState;
 use crate::upstream::Upstream;
+
+/// Result alias without anyhow: main() and build_state() only need a
+/// boxed, displayable, sendable error.
+pub type BoxResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 /// Build the proxy state for an arbitrary Codex upstream base and auth dir.
 ///
@@ -36,7 +39,7 @@ pub async fn build_state(
     auth_token: Option<String>,
     default_effort: &str,
     chain: Vec<String>,
-) -> Result<AppState> {
+) -> BoxResult<AppState> {
     let auth = Arc::new(AuthStore::load(codex_home).await?);
     let upstream = Arc::new(Upstream::new(upstream_base.to_string(), auth)?);
     let catalog = Arc::new(Catalog::new(upstream.clone()));
