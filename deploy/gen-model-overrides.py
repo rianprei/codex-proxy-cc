@@ -35,6 +35,9 @@ MODEL_MAIN = os.environ.get("CLAUDE_CODEX_MODEL", "claude-gpt-6-astra")
 # fora do seletor). NÃO há linhas por esforço.
 MAIN_MODELS = {
     "gpt-6-astra":   ("GPT-6 Astra",   "claude-opus-4-8"),
+    "gpt-6-sol":     ("GPT-6 Sol",     "claude-sonnet-5"),
+    "gpt-6-luna":    ("GPT-6 Luna",    "claude-haiku-4-5-20251001"),
+    "gpt-6.1-sol":   ("GPT-6.1 Sol",   "claude-opus-4-8"),
     "gpt-5.6-sol":   ("GPT-5.6 Sol",   "claude-sonnet-5"),
     "gpt-5.6-terra": ("GPT-5.6 Terra", "claude-sonnet-4-6"),
     "gpt-5.6-luna":  ("GPT-5.6 Luna",  "claude-haiku-4-5-20251001"),

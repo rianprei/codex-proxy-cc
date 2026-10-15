@@ -82,6 +82,9 @@ pub fn resolve_in(models: &[UpstreamModel], id: &str) -> Option<Resolved> {
 /// resolvable by direct id but are not advertised.
 const MAIN_SLUGS: &[&str] = &[
     "gpt-6-astra",
+    "gpt-6-sol",
+    "gpt-6-luna",
+    "gpt-6.1-sol",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.6-luna",
