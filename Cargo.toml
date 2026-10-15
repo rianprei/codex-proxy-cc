@@ -6,7 +6,7 @@ description = "Anthropic Messages API proxy for Codex (ChatGPT login) models, fo
 license = "MIT"
 
 [dependencies]
-axum = "0.7"
+axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio"] }
 bytes = "1"
 futures-core = "0.3"
 log = { version = "0.4", features = ["std"] }
