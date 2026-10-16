@@ -67,7 +67,10 @@ pub fn rfc3339_now_micros() -> String {
     let (y, mo, d) = civil_from_days(secs.div_euclid(86400));
     let sod = secs.rem_euclid(86400);
     let (h, mi, s) = (sod / 3600, (sod / 60) % 60, sod % 60);
-    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{:06}Z", nanos / 1000)
+    format!(
+        "{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{:06}Z",
+        nanos / 1000
+    )
 }
 
 /// Format a unix timestamp as RFC 3339 (second precision).

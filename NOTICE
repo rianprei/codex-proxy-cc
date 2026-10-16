@@ -15,15 +15,18 @@ adds one (see LICENSE, dual copyright) to make the declared grant explicit.
   - explicit rejection of unsupported content blocks (incl. nested
     tool_result.content), bounded upstream retry with quota-exhaustion
     distinction, terminal retry-after per the Claude Code gateway contract
-  - one-entry-per-base-model catalog (4 mains; effort is a request parameter
+  - one-entry-per-base-model catalog (7 mains; effort is a request parameter
     via output_config.effort), sanitized/redacted diagnostics
   - stale-while-revalidate catalog + boot prewarm
   - field regression suite (tests/regression.sh) and research docs
-  - deployment layer (deploy/): launcher, multi-backend router and picker
-    generator for a single-command `claude` experience
+  - deployment layer (deploy/): launcher, multi-backend router, picker
+    generator and the `claudecodex.service` systemd unit for a
+    single-command `claude` experience
 
 ## Upstream limitations kept honestly
 
-- The upstream has no CI; this fork adds none yet.
+- The upstream has no CI; this fork adds one (`.github/workflows/ci.yml`:
+  fmt + clippy -D warnings + the full test suite + a release build with a
+  5 MB size budget).
 - Effort levels are whatever the authenticated backend declares; nothing is
   invented. Context-window limits are UNKNOWN (backend does not expose them).

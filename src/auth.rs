@@ -80,8 +80,8 @@ impl AuthStore {
             }
             Err(e) => return Err(format!("read {}: {e}", path.display()).into()),
         };
-        let file: AuthFile = serde_json::from_slice(&raw)
-            .map_err(|e| format!("parse {}: {e}", path.display()))?;
+        let file: AuthFile =
+            serde_json::from_slice(&raw).map_err(|e| format!("parse {}: {e}", path.display()))?;
         if file.tokens.access_token.is_empty() || file.tokens.refresh_token.is_empty() {
             return Err(format!(
                 "{} has no ChatGPT tokens: run `codex login` first",

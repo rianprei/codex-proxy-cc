@@ -11,9 +11,9 @@ Como esta máquina roda o `claude` no backend Codex da assinatura ChatGPT Pro:
   modelo (Codex / NIM / Anthropic nativo com o OAuth do usuário), auth de
   cliente obrigatória, Host check anti-rebinding, cap de 32MB, abort do
   cliente propagado ao upstream.
-- `gen-model-overrides.py` → mesmo diretório — gera as 4 linhas do
-  modelPicker na config isolada a partir do catálogo autenticado;
-  idempotente (só regrava quando muda).
+- `gen-model-overrides.py` → mesmo diretório — gera as 7 linhas do
+  modelPicker (uma por modelo-base MAIN) na config isolada a partir do
+  catálogo autenticado; idempotente (só regrava quando muda).
 
 Autenticação: somente leitura de `~/.codex/auth.json` (sessão existente do
 Codex CLI). Nenhum OAuth adicional, nenhuma API paga, nenhum segredo em

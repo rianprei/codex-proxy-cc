@@ -11,10 +11,10 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use tokio_stream::StreamExt as _;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::StreamExt as _;
 
 use crate::anthropic::{ApiError, ErrorBody, MessagesRequest, StreamEvent};
 use crate::models::Catalog;

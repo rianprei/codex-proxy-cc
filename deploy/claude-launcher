@@ -68,8 +68,8 @@ for attempt in 1 2 3; do
 try:
     for m in json.load(open(sys.argv[1]))["data"]: print(m["id"])
 except Exception: pass' "$SNAPSHOT" 2>/dev/null || true)
-  # Gate de presença (defaults) + de contagem (4 mains — fleet #6:
-  # parcial passava em silêncio com só os 2 defaults presentes).
+  # Gate de presença (defaults) + de contagem (piso de 4 dos 7 mains —
+  # fleet #6: parcial passava em silêncio com só os 2 defaults presentes).
   present=1
   for m in "$MODEL_MAIN" "$MODEL_FAST"; do
     grep -qxF "$m" <<<"$catalog" || present=0
@@ -82,11 +82,11 @@ done
 if [ "$ok" != 1 ]; then
   systemctl --user is-active claudecodex.service >/dev/null 2>&1 \
     || die "modelos Codex ausentes do catálogo e claudecodex.service inativo (systemctl --user status claudecodex claude-multirouter)"
-  die "catálogo incompleto após 3 tentativas (${n_codex:-0}/4 modelos Codex; claudecodex ativo; journalctl --user -u claudecodex -n 20)"
+  die "catálogo incompleto após 3 tentativas (${n_codex:-0} de 4+ modelos Codex; claudecodex ativo; journalctl --user -u claudecodex -n 20)"
 fi
 
-# Escreve as 4 linhas do picker a partir do catálogo autenticado; so na config
-# isolada; só regrava quando o resultado difere do estado atual.
+# Escreve as 7 linhas do picker (uma por MAIN_MODEL) a partir do catálogo
+# autenticado; só na config isolada; só regrava quando o resultado difere.
 CLAUDE_CODEX_MODEL="$MODEL_MAIN" CLAUDE_CODEX_CATALOG_FILE="$SNAPSHOT" \
   python3 "$HOME/.local/share/claude-multirouter/gen-model-overrides.py" || true
 

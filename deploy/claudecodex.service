@@ -1,0 +1,51 @@
+# claudecodex.service — systemd --user unit for the claudecodex proxy.
+# Install: cp deploy/claudecodex.service ~/.config/systemd/user/ && systemctl --user daemon-reload
+# The local client-auth token lives in the EnvironmentFile (never in argv or logs).
+# Codex credentials are READ from ~/.codex/auth.json (codex login); the proxy
+# refreshes and rewrites that file when the access token expires.
+
+[Unit]
+Description=claudecodex — Anthropic-compatible proxy reusing ~/.codex/auth.json
+Documentation=https://github.com/rianprei/codex-proxy-cc
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=5
+StartLimitBurst=10
+
+[Service]
+Type=simple
+# The bearer token below is the LOCAL client-auth secret for this proxy only; it
+# is unrelated to the ChatGPT subscription and never authenticates upstream.
+EnvironmentFile=%h/.config/claude-codex/proxy.env
+# Tuning portado do claude-nim (overclock): teto de memória sem swap, arena
+# única de malloc do glibc, logs reduzidos (RUST_LOG=warn), prioridade máxima
+# de CPU/IO e OOM ajustado para não matar o proxy primeiro.
+Environment=MALLOC_ARENA_MAX=2
+Environment=RUST_LOG=warn
+MemoryMax=256M
+MemorySwapMax=0
+OOMScoreAdjust=-500
+CPUWeight=100
+Nice=-10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=0
+ExecStart=%h/.local/bin/claudecodex --port 18766 --bind 127.0.0.1
+Restart=always
+RestartSec=1
+KillSignal=SIGTERM
+TimeoutStopSec=10
+UMask=0077
+
+# Codex auth.json must be readable; refresh writes back to it.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=%h/.codex
+
+[Install]
+WantedBy=default.target

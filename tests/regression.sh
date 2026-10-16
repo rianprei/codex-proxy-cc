@@ -47,9 +47,11 @@ try:
     print('%d:%d' % (len(c), sum(1 for m in c if ':' in m['id'])))
 except Exception: print('0:1')")
   CCNT="${N%%:*}"; CCOL="${N##*:}"
-  [ "${CCNT:-0}" = "4" ] && [ "${CCOL:-1}" = "0" ] \
-    && ok "catálogo: 4 modelos-base, 0 variantes de esforço" \
-    || bad "catálogo errado (base=$CCNT com-esforço=$CCOL)" "esperado 4/0"
+  # 7 MAIN_SLUGS no seletor; o backend expõe um subconjunto (mín. 4 verificados
+  # por inferência). Nunca variantes de esforço como id de modelo.
+  [ "${CCNT:-0}" -ge 4 ] && [ "${CCNT:-0}" -le 7 ] && [ "${CCOL:-1}" = "0" ] \
+    && ok "catálogo: ${CCNT} modelos-base (4..7), 0 variantes de esforço" \
+    || bad "catálogo errado (base=$CCNT com-esforço=$CCOL)" "esperado 4..7/0"
   grep -q 'CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1' "$CCX" \
     && ok "launcher ativa gateway discovery" \
     || bad "launcher sem discovery" "o /model não popula via gateway"
@@ -72,11 +74,15 @@ rows=(s.get('modelPicker') or {}).get('options') or []
 assert '_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL' not in env, "assertion first-party presente"
 assert 'CLAUDE_CODE_USE_COWORK_PLUGINS' not in env, "USE_COWORK_PLUGINS mata o behavesAs"
 codex=[r for r in rows if str(r.get('model','')).startswith('claude-gpt-')]
-assert len(codex)==4, f"picker com {len(codex)} linhas codex (esperado 4)"
+assert len(codex)==7, f"picker com {len(codex)} linhas codex (esperado 7)"
 assert all(':' not in r['model'] for r in codex), "linha com sufixo de esforço"
-assert s.get('model','').startswith('claude-gpt-'), "model default não é o alias"
+# O default é a seleção ATUAL do usuário (qualquer backend roteado — o
+# launcher re-injeta --model $MODEL_MAIN a cada launch); o que não pode é
+# reverter para um id fora do picker (default da conta, bypass do seletor).
+assert s.get('model','') in {r.get('model') for r in rows}, \
+    f"model default '{s.get('model','')}' fora dos aliases do picker"
 PY
-then ok "settings: gates + 4 linhas Codex + default no alias"
+then ok "settings: gates + 7 linhas Codex + default no alias"
 else bad "settings isolado inválido" "confira env/modelPicker/model"
 fi
 

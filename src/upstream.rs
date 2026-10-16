@@ -233,8 +233,10 @@ impl Upstream {
                 let body = resp.text().await.unwrap_or_default();
                 return Err(UpstreamError::Status { status, body });
             }
-            let parsed: ModelsResponse =
-                resp.json().await.map_err(|e| format!("parse /models: {e}"))?;
+            let parsed: ModelsResponse = resp
+                .json()
+                .await
+                .map_err(|e| format!("parse /models: {e}"))?;
             return Ok(parsed.models);
         }
         Err("unreachable: /models retry loop exhausted".into())

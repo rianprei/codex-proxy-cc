@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test
+
+      - name: Release build (size budget 5 MB)
+        run: |
+          cargo build --release
+          SIZE=$(stat -c %s target/release/claudecodex)
+          echo "release binary: $SIZE bytes ($(( SIZE / 1024 )) KiB)"
+          if [ "$SIZE" -gt 5242880 ]; then
+            echo "::error::release binary is $SIZE bytes — over the 5 MiB budget (regression in the dependency tree or release profile?)"
+            exit 1
+          fi
