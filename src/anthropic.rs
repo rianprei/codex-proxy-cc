@@ -26,6 +26,12 @@ pub struct MessagesRequest {
     /// effort selection in `output_config.effort` (gateway protocol contract).
     #[serde(default)]
     pub output_config: Option<OutputConfig>,
+    #[serde(default)]
+    pub temperature: Option<f64>,
+    #[serde(default)]
+    pub top_p: Option<f64>,
+    #[serde(default)]
+    pub stop_sequences: Option<Vec<String>>,
 }
 
 /// Only the effort field is consumed; other output_config settings pass through

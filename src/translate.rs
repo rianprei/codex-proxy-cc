@@ -421,6 +421,8 @@ pub fn anthropic_to_responses(
         include: vec!["reasoning.encrypted_content"],
         prompt_cache_key,
         text: None,
+        temperature: req.temperature,
+        top_p: req.top_p,
     }
 }
 
