@@ -87,6 +87,13 @@ pub enum ContentBlock {
         #[serde(default)]
         is_error: bool,
     },
+    #[serde(rename = "tool_reference")]
+    ToolReference {
+        #[serde(default)]
+        name: String,
+        #[serde(default)]
+        id: Option<String>,
+    },
     #[serde(rename = "thinking")]
     Thinking {
         #[serde(default)]

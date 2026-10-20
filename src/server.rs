@@ -440,11 +440,13 @@ async fn run_chain(
 
 /// Content block types this proxy can faithfully translate to the Codex
 /// Responses API. Anything else must fail loudly, not silently vanish.
+/// `tool_reference` (Claude Code 2.1.300+) is converted to a text reference.
 const SUPPORTED_BLOCKS: &[&str] = &[
     "text",
     "image",
     "tool_use",
     "tool_result",
+    "tool_reference",
     "thinking",
     "redacted_thinking",
 ];

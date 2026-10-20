@@ -279,6 +279,26 @@ pub fn build_input(req: &MessagesRequest) -> Vec<Value> {
                                 }));
                             }
                         }
+                        ContentBlock::ToolReference { name, id } => {
+                            // Claude Code 2.1.300+ sends tool_reference blocks
+                            // when referencing a previously declared tool.
+                            // The Codex backend has no equivalent — convert
+                            // to a text reference so the model sees the context.
+                            let text = if let Some(rid) = id {
+                                format!("[tool_reference: {name} ({rid})]")
+                            } else {
+                                format!("[tool_reference: {name}]")
+                            };
+                            if is_user {
+                                b.flush_assistant();
+                                b.user_parts
+                                    .push(json!({"type": "input_text", "text": text}));
+                            } else {
+                                b.flush_user();
+                                b.assistant_parts
+                                    .push(json!({"type": "output_text", "text": text}));
+                            }
+                        }
                         ContentBlock::Thinking {
                             thinking,
                             signature,
